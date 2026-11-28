@@ -113,6 +113,8 @@ def _symmetric_tensor(shape):
 @torch.inference_mode()
 def test_inkling2_fp32_oneshot_matches_multimem():
     _, nccl_group = _init_world()
+    if dist.get_world_size() not in (4, 8):
+        pytest.skip("The Inkling2 one-shot all-reduce supports only 4 or 8 ranks")
     group = SimpleNamespace(world_size=dist.get_world_size(), device_group=nccl_group)
     rank = dist.get_rank()
     for rows in (1, 2, inkling2_comm.FP32_ONESHOT_MAX_TOKENS):

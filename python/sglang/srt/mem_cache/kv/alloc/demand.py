@@ -100,8 +100,8 @@ def request_demand(
     chunks of at most ``chunk_size`` and then decode ``max_new_tokens``.
 
     The token sub-pool takes the page-ceiled prompt, the decode, the rows a
-    decode step allocates ahead (``decode_retire_lag``: the overlap scheduler's
-    next step or a speculative reserve) and one rounding page, plus
+    decode step allocates ahead (``decode_retire_lag``, the decode-ahead) and
+    one rounding page, plus
     ``extra_tokens``. Each window of ``windows`` (name to retained window) takes
     one bound over every phase: the request's own rows, capped by the retained
     window plus the larger of a prefill chunk with what retirement keeps beside
@@ -269,20 +269,17 @@ def window_retirement(*, shares_prefixes: bool) -> WindowRetirement:
     (`ScheduleBatch.maybe_evict_swa`). Without prefix sharing, the overlap
     scheduler retires a prefill's rows a chunk behind its frontier; decode
     retires once SGLANG_SWA_EVICTION_INTERVAL rows fell out of the window,
-    behind the processed length, while each step allocates ahead of it (the
-    overlap lag, or the speculative reserve `get_spec_decode_reserve`)."""
+    behind the processed length, while each step allocates ahead of it by the
+    decode-ahead (`get_decode_ahead`)."""
     from sglang.srt.environ import envs
-    from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reserve
+    from sglang.srt.mem_cache.allocation_sizing import get_decode_ahead
     from sglang.srt.runtime_context import get_schedule, get_spec
 
     schedule = get_schedule()
     chunk = schedule.chunked_prefill_size or 0
     overlap = not schedule.disable_overlap_schedule
     prefill_lag = chunk if overlap and not shares_prefixes and chunk > 0 else 0
-    if get_spec().speculative_algorithm:
-        decode_lag = get_spec_decode_reserve()
-    else:
-        decode_lag = 1 if overlap else 0
+    decode_lag = get_decode_ahead()
     interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
     if windows_retire_by_forward():
         # Between two retirements every forward but the retiring one commits

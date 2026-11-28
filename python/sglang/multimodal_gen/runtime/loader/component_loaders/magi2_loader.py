@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 from torch import nn
+from transformers import Qwen3_5TextConfig
 
 from sglang.multimodal_gen.configs.models.dits.magi2 import (
     Magi2PreviewArchConfig,
@@ -26,12 +27,19 @@ from sglang.multimodal_gen.configs.models.vaes.magi2 import (
     Magi2TurboVAEConfig,
     Magi2VideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    TextEncoderLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     set_default_torch_dtype,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.magi2_layers import Magi2ModalityRMSNorm
 from sglang.multimodal_gen.runtime.models.dits.magi2_preview import Magi2PreviewDiT
@@ -651,25 +659,52 @@ def load_magi2_tokenizer(*, component_path: str):
     return tokenizer
 
 
-def load_magi2_text_encoder(
-    *, component_path: str, device: torch.device, param_dtype: torch.dtype
-):
-    """``AutoModel`` here resolves the multimodal wrapper, so the text model is named explicitly (magi2_core/model/qwen35.py:250)."""
-    try:
-        from transformers import Qwen3_5TextModel
-    except ImportError as e:
-        raise RuntimeError(
-            "MAGI-2's text encoder needs a transformers build providing "
-            "Qwen3_5TextModel; AutoModel would silently load a different "
-            "module and a different hidden state"
-        ) from e
+class _Magi2TextEncoderStandIn(LayerwiseOffloadableModuleMixin, nn.Module):
+    """Fills the text encoder slot on ranks that never encode; the source rank broadcasts the embeddings."""
 
-    text_encoder = Qwen3_5TextModel.from_pretrained(
-        component_path, torch_dtype=param_dtype
+    layer_names = ["layers"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Layerwise offload rejects a component with no stack to manage, so this
+        # rank keeps a one-weight layer instead of the encoder's 64.
+        self.layers = nn.ModuleList([nn.Linear(1, 1, bias=False)])
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "MAGI-2 runs its text encoder on the sequence-parallel source rank only"
+        )
+
+
+def load_magi2_text_encoder(
+    *,
+    component_path: str,
+    server_args: ServerArgs,
+    component_name: str,
+    param_dtype: torch.dtype,
+):
+    """Qwen3.5's text stack as SGLang's native encoder, so residency can stream it onto the GPU."""
+    if get_sp_group().rank_in_group != 0:
+        return _Magi2TextEncoderStandIn()
+
+    config = server_args.pipeline_config.text_encoder_configs[0]
+    with open(os.path.join(component_path, "config.json")) as f:
+        # The checkpoint is Qwen3_5ForConditionalGeneration; only its text model encodes.
+        config.arch_config.text_config = Qwen3_5TextConfig(
+            **json.load(f)["text_config"]
+        )
+    config.post_diffusers_config_update()
+    # Only this rank encodes, so the encoder may not join a collective spanning
+    # the others (the conditioning cache all-reduces over its fold group).
+    config.parallel_folding_mode = None
+
+    return TextEncoderLoader().load_model(
+        component_path,
+        config,
+        server_args,
+        dtype=str(param_dtype).removeprefix("torch."),
+        component_name=component_name,
     )
-    text_encoder = text_encoder.to(device).eval()
-    text_encoder.requires_grad_(False)
-    return text_encoder
 
 
 def build_expert_parallel_group(server_args: ServerArgs) -> dist.ProcessGroup | None:
@@ -753,18 +788,11 @@ class Magi2RefinerDiTLoader(_Magi2WeightsLoader):
 class Magi2TextEncoderLoader(_Magi2WeightsLoader):
     expected_library = "transformers"
 
-    @staticmethod
-    def target_device(component_starts_on_cpu: bool) -> torch.device:
-        # Magi2TextEncodingStage runs the forward on the CPU under any residency,
-        # and as a plain transformers module the encoder cannot be layer-streamed.
-        return torch.device("cpu")
-
     def load_customized(self, component_model_path, server_args, component_name):
         return load_magi2_text_encoder(
             component_path=component_model_path,
-            device=self.target_device(
-                server_args.should_start_component_on_cpu(component_name)
-            ),
+            server_args=server_args,
+            component_name=component_name,
             param_dtype=resolve_component_precision(server_args, component_name),
         )
 

@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_group,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -163,6 +164,7 @@ class Magi2TextEncodingStage(PipelineStage):
                 component_name="text_encoder", module=self.text_encoder
             ),
             torch.no_grad(),
+            set_forward_context(current_timestep=0, attn_metadata=None),
         ):
             output = self.text_encoder(**tokens, output_hidden_states=True)
 
@@ -172,17 +174,14 @@ class Magi2TextEncodingStage(PipelineStage):
         return [hidden[row, : int(length)] for row, length in enumerate(lengths)]
 
     def _encode_and_share(self, prompts: list[str]) -> list[torch.Tensor]:
-        """The forward stays on the CPU: staging the encoder to a card costs more than it saves, and spikes on the resident DiTs."""
+        """Only the source rank runs the encoder; residency streams its layers onto that rank's GPU."""
         sp_group = get_sp_group()
         is_src = sp_group.rank_in_group == 0
         device = get_local_torch_device()
 
         embeds: list[torch.Tensor] | None = None
         if is_src:
-            embeds = [
-                embed.to(device)
-                for embed in self._encode(prompts, device=torch.device("cpu"))
-            ]
+            embeds = self._encode(prompts, device=device)
 
         if sp_group.world_size == 1:
             return embeds

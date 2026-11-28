@@ -632,16 +632,16 @@ class LogitsProcessor(nn.Module):
         info = forward_batch.sampling_info
         if info is None:
             return False
-        from sglang.srt.sampling.sampling_batch_info import adjusts_logits
         from sglang.srt.speculative.sharded_verify import (
             sampling_allows_vocab_shards,
             spec_allows_vocab_shards,
         )
 
-        has_grammar = bool(info.grammars) and any(g is not None for g in info.grammars)
+        route = forward_batch.verify_route
         return sampling_allows_vocab_shards(
             info,
-            adjusts_logits=adjusts_logits(info, has_grammar=has_grammar),
+            adjusts_logits=route.adjusts_logits,
+            need_truncated_sampling=route.need_truncated_sampling,
             return_logprob=forward_batch.return_logprob,
             # request seeds stay on stock seeded sampling
             has_local_keys=self._sharded_verify_temperature_keys
