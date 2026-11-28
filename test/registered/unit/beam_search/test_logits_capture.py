@@ -4,10 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.beam_search.batch_tail import BeamTail, BeamTailEntry
-from sglang.srt.beam_search.logits_capture import (
-    capture_pre_sample_logits,
-    is_beam_only_batch,
-)
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,25 +28,9 @@ def _decode_batch(reqs, members=2):
     return batch, start
 
 
-def _extend_batch(reqs, mode=ForwardMode.EXTEND):
-    return SimpleNamespace(beam_tail=None, forward_mode=mode, reqs=reqs)
-
-
-class TestBeamOnlyBatch(CustomTestCase):
-    def test_any_regular_row_keeps_the_sampler(self):
-        """Only a batch whose every reqs-aligned row is a beam leader may skip the
-        sampler; a regular request in it still needs its sampled token."""
-        beam, regular = _req(True), _req(False)
-        self.assertTrue(is_beam_only_batch(_decode_batch([beam, _req(True)])[0]))
-        self.assertFalse(is_beam_only_batch(_decode_batch([regular, beam])[0]))
-        self.assertFalse(is_beam_only_batch(_decode_batch([regular])[0]))
-        self.assertTrue(is_beam_only_batch(_extend_batch([beam])))
-        self.assertFalse(is_beam_only_batch(_extend_batch([beam, regular])))
-        self.assertFalse(is_beam_only_batch(_extend_batch([beam], ForwardMode.MIXED)))
-
+class TestLogitsCapture(CustomTestCase):
     def test_mixed_decode_capture_survives_in_place_sampling(self):
-        """The sampler rewrites the reqs-aligned logits in place, so a batch that
-        still samples must hand the coordinator a copy of its leader rows."""
+        """A batch that still samples must capture a copy of its leader rows."""
         batch, num_tail = _decode_batch([_req(False), _req(True)])
         logits = torch.randn((2 + num_tail, 4))
         leader_row = logits[1].clone()

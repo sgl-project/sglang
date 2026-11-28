@@ -23,7 +23,7 @@ DECODE_LEN = 2
 
 
 class _FakeRunner(SimpleNamespace):
-    """Weak-referenceable: the shared-context support verdict is cached per runner."""
+    """Weak-referenceable, as the per-runner support verdict cache needs."""
 
     __hash__ = object.__hash__
 
@@ -67,9 +67,8 @@ def _prepare(batch, model_runner):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestBeamDecodeBatchPrep(CustomTestCase):
     def test_beam_decode_batch_prep_never_syncs_the_host(self):
-        """Overlap: building a beam decode batch (member tail, per-row trie levels,
-        shared-context metadata) issues no host sync, so the overlap scheduler
-        prepares and launches the next step while the current forward still runs."""
+        """Building a beam decode batch (member tail, trie levels, shared-context
+        metadata) issues no host sync, so overlap can prepare it during the forward."""
         model_runner = _FakeRunner(
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(
@@ -98,7 +97,6 @@ class TestBeamDecodeBatchPrep(CustomTestCase):
                 return_value=SimpleNamespace(num_codebooks=3),
             ),
         ):
-            # Warm-up: first allocations and kernel loads.
             _prepare(_decode_batch(), model_runner)
             torch.cuda.synchronize()
             batch = _decode_batch()
@@ -110,7 +108,6 @@ class TestBeamDecodeBatchPrep(CustomTestCase):
         rows = NUM_GROUPS * BEAM
         self.assertEqual(batch.seq_lens.tolist(), [PROMPT_LEN + DECODE_LEN] * rows)
         self.assertEqual(levels.tolist(), [DECODE_LEN] * rows)
-        self.assertIsNotNone(metadata)
         self.assertEqual(len(metadata.buckets), 1)
         bucket = metadata.buckets[0]
         self.assertEqual(bucket.decode_lens.tolist(), [DECODE_LEN] * NUM_GROUPS)

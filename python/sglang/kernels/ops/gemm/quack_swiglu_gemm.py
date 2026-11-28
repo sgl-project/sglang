@@ -1,9 +1,7 @@
-"""SM120 gate_up GEMM with SwiGLU fused into its epilogue (quack warp-MMA GEMM).
+"""SM120 gate_up GEMM with SwiGLU fused into its epilogue (quack).
 
-Computes ``silu(x @ W_gate.T) * (x @ W_up.T)`` from a merged ``[gate; up]`` weight
-``[2 * I, K]``, read in place through quack's concat layout: bf16 in and out, fp32
-accumulation. The activation reads the fp32 accumulator, so gate and up are not
-rounded to bf16 first as they are when ``SiluAndMul`` follows a separate GEMM.
+The activation reads the fp32 accumulator, so gate and up are not rounded to bf16
+first, unlike ``SiluAndMul`` after a separate GEMM.
 """
 
 from __future__ import annotations
@@ -14,8 +12,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.utils.common import ceil_div
 
-# quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it; 0.6.5
-# also accepts other multiples of 32, which were not measured here.
+# quack 0.6.4's SM120 tile widths, widest first so ties keep it.
 _TILE_N_CHOICES = (192, 160, 128)
 
 
@@ -30,8 +27,7 @@ def _swiglu_epilogue_mod():
 
 @cache_once
 def _tile_shape(m: int, n: int, num_sms: int) -> tuple[int, int]:
-    # Least wave-quantized work per SM; ties keep the taller, then wider tile.
-    # 64-row tiles only within one wave; measured slower past it (Qwen3-0.6B, SM120).
+    # Least wave-quantized work per SM. 64-row tiles only within one wave: slower past it.
     def num_tiles(tile_m: int, tile_n: int) -> int:
         return ceil_div(m, tile_m) * ceil_div(n, tile_n)
 

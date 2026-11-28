@@ -269,10 +269,8 @@ class TestBeamGroup(CustomTestCase):
         self.assertEqual(group.stop_token_ids.tolist(), ids)
 
     def test_dropped_request_frees_its_group_without_a_gc_pass(self):
-        """A request and its group must be freed by reference counting once the
-        scheduler drops the request. A reference cycle between them left every
-        finished beam request to Python's full GC passes, which stall the
-        scheduler for as long as they scan."""
+        """Dropping the request frees its group by refcount: a cycle between them
+        would leave finished requests to full GC passes."""
 
         class Req:  # weakly referenceable, as the scheduler's Req is
             pass

@@ -28,12 +28,11 @@ not the individual row -- owns that region: it is freed once, deduped, at
 group finish.
 
 Every tick splits in two, and the whole file follows the naming. select_* is
-the launch half (tensor-side, no host sync, so it queues behind the forward)
-and must run before the next forward resolves its inputs, so the relayed tokens
-and reparented KV are the selected ones. commit_* is the deferred half (DAG
-build, finish/abort); under overlap it lags one forward and discards overshoot
-steps. Sync callers run both within one tick. Commits are tick-gated;
-BeamGroup.commit_pending documents why.
+the launch half (tensor-side, no D2H) and must run before the next forward
+resolves its inputs, so the relayed tokens and reparented KV are the selected
+ones. commit_* is the deferred half (DAG build, finish/abort); under overlap it
+lags one forward and discards overshoot steps. Sync callers run both within one
+tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 """
 
 from __future__ import annotations

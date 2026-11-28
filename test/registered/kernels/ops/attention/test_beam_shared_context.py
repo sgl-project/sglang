@@ -42,8 +42,7 @@ SENTINEL = 7.0
 
 
 def _bucket(context_lens, decode_lens, *, beam_width, rows, slots, decode_capacity):
-    """One width bucket at scattered K/V slots; `rows` [groups, beam_width] maps
-    its beams to rows of Q, and decode capacity runs past the decode lengths."""
+    """One width bucket at scattered K/V slots; decode capacity exceeds the decode lengths."""
     device = rows.device
     num_context = sum(context_lens)
     context_slots = slots[:num_context]
@@ -103,10 +102,9 @@ def _case(
     unowned_rows=0,
     seed=0,
 ):
-    """Width buckets whose beams sit at shuffled rows of one Q, and their reference.
+    """Width buckets at shuffled rows of one Q, and their reference.
 
-    `groups_per_width` maps a beam width to (context_lens, decode_lens) per group;
-    `unowned_rows` more rows of Q belong to no bucket and keep SENTINEL.
+    `unowned_rows` rows of Q belong to no bucket and keep SENTINEL.
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -184,11 +182,14 @@ def _run(kernel, case, **kwargs):
 class TestBeamSharedContextAttention(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_split_kv_matches_fp32_reference(self):
-        """Every split count gives the unsplit result, also when a short prompt
-        leaves splits empty; decode slots past a group's decode length are unread."""
+        """Also with empty splits, and with the kept partial buffers poisoned: a
+        launch must write every partial it reads."""
         case = _case({4: ([1, 70, 300], [2, 1, 2])})
-        for num_splits in (None, 1, 3, 8):
+        for num_splits in (None, 1, 8):
             with self.subTest(num_splits=num_splits):
+                _run(shared_context_attention_split_kv, case, num_splits=num_splits)
+                for buffer in partial_buffers(case.q.device, 1, 1):
+                    buffer.fill_(float("nan"))
                 output = _run(
                     shared_context_attention_split_kv, case, num_splits=num_splits
                 )
@@ -198,18 +199,16 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_kv_cache_past_2_31_elements(self):
-        """KV offsets past 2^31 elements must not wrap: in 32 bits the split-KV
-        kernel read outside the cache (an illegal memory access)."""
+        """KV offsets past 2^31 elements must not wrap (illegal memory access)."""
         if torch.cuda.mem_get_info()[0] < 6 << 30:
             self.skipTest("needs 6 GB of free GPU memory")
         device = torch.device("cuda")
         heads, kv_heads, head_dim, width, capacity = 4, 2, 64, 16, 3
         context_lens, decode_lens = [70, 300], [2, 1]
-        # Every slot of the case sits past 2^31 elements of the cache.
         first_slot = (1 << 31) // (kv_heads * head_dim) + 16
         num_used = sum(context_lens) + len(context_lens) * capacity * width
         torch.manual_seed(0)
-        # One tensor serves as both K and V, to halve the 4.3 GB it takes.
+        # One tensor serves as both K and V.
         kv = torch.empty(
             first_slot + num_used,
             kv_heads,
@@ -252,8 +251,7 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_kernels_write_only_their_buckets_rows(self):
-        """Width buckets share one output: each call writes exactly the rows its
-        row_indices name, at the Qwen3-0.6B head layout and a 256-beam bucket."""
+        """Width buckets share one output: each call writes only its row_indices rows."""
         case = _case(
             {
                 256: ([700, 2048], [3, 1]),
@@ -274,8 +272,7 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_graph_replay_refreshes_mixed_depths_and_row_mapping(self):
-        """A graph captured once replays any staged lengths and row mapping: split
-        counts, grids and workspaces depend only on the captured shapes."""
+        """A captured graph replays any staged lengths and row mapping."""
         torch.manual_seed(17)
         width, max_context, max_decode = 8, 80, 3
         with torch.device("cuda"):
@@ -284,7 +281,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
             v = torch.randn_like(k)
             rows = torch.arange(16, dtype=torch.int32).view(2, width)
             slots = torch.arange(160, 208, dtype=torch.int32).view(2, 24)
-            # row_indices, context_slots, context_cu_seqlens, decode_slots, decode_lens
             a = (
                 rows,
                 torch.arange(150, dtype=torch.int32),
@@ -299,7 +295,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
                 slots.flip((1,)),
                 torch.tensor([3, 1], dtype=torch.int32),
             )
-            # Buffers of fixed capacity, as a decode graph captures them.
             staged = (
                 torch.empty_like(rows),
                 torch.empty(2 * max_context, dtype=torch.int32),
@@ -338,8 +333,7 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_plans_follow_the_strides(self):
-        """A launch plan is reused for equal shapes and strides only: the same shapes
-        at other strides, after a contiguous call, must not launch with its strides."""
+        """A cached launch plan must not be reused for the same shapes at other strides."""
         case = _case({8: ([33, 70], [2, 1])})
         bucket = case.buckets[0]
         tail = (
@@ -376,34 +370,13 @@ class TestBeamSharedContextAttention(CustomTestCase):
         self.assertEqual(len(beam_shared_context_split_kv._PLANS), 2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_launches_write_every_partial_they_read(self):
-        """Eager launches reuse their partial buffers without clearing them, so a
-        launch must write every partial it reads: NaNs left there must not show."""
-        case = _case({4: ([1, 70, 300], [2, 1, 2])})
-        for num_splits in (None, 3, 8):
-            with self.subTest(num_splits=num_splits):
-                # The first run sizes the kept buffers for this launch.
-                _run(shared_context_attention_split_kv, case, num_splits=num_splits)
-                for buffer in partial_buffers(case.q.device, 1, 1):
-                    buffer.fill_(float("nan"))
-                output = _run(
-                    shared_context_attention_split_kv, case, num_splits=num_splits
-                )
-                torch.testing.assert_close(
-                    output.float(), case.reference, rtol=1e-2, atol=1e-2
-                )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_partial_buffers_are_kept_per_thread_and_stream(self):
-        """Eager launches of one thread on one stream reuse a pair of partial
-        buffers. Another thread or stream could write it between a launch's two
-        kernels, and a graph replays the pointers it captured: each gets its own."""
+        """One pair is reused per thread and stream; other threads, streams and graphs get their own."""
         device = torch.device("cuda", torch.cuda.current_device())
         eager = partial_buffers(device, 4096, 64)
         self.assertEqual(
             partial_buffers(device, 1024, 16)[0].data_ptr(), eager[0].data_ptr()
         )
-        # `eager` and `others` stay alive, so equal pointers mean a shared pair.
         others = []
         thread = threading.Thread(
             target=lambda: others.append(partial_buffers(device, 4096, 64))

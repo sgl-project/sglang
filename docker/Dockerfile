@@ -621,9 +621,8 @@ ARG USE_LATEST_SGLANG
 
 WORKDIR /sgl-workspace
 
-# torch 2.14 pins nvidia-cublas 13.1, which has no SM120 GEMM kernels; SM120 images can opt into
-# 13.4 (--build-arg SGL_CUBLAS_VERSION=13.4.3.11). After every install that resolves torch's
-# dependencies (they would pin 13.1 back), and before the source copy, so source changes keep it.
+# torch 2.14 pins cuBLAS 13.1, which has no SM120 GEMM kernels; SM120 images can opt into
+# 13.4 (--build-arg SGL_CUBLAS_VERSION=13.4.3.11). Keep after every torch dependency install.
 ARG SGL_CUBLAS_VERSION=
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -n "${SGL_CUBLAS_VERSION}" ]; then \

@@ -67,31 +67,31 @@ def _shared_context_split_kv_kernel(
     output,  # like q; written here only when WRITE_PARTIALS is false
     partial_output,  # fp32 [num_splits, groups * BEAM_WIDTH, q_heads, HEAD_DIM]
     partial_lse,  # fp32 [num_splits, groups * BEAM_WIDTH, q_heads], log2 softmax sums
-    softmax_scale,  # float, scales q.k before the softmax
+    softmax_scale,
     num_splits,  # prompt splits per tile; the grid's axis 0 is groups * num_splits
-    stride_q_row,  # q.stride(0); all strides are in elements
-    stride_q_head,  # q.stride(1)
-    stride_row_group,  # row_indices.stride(0)
-    stride_row_beam,  # row_indices.stride(1)
-    stride_k_slot,  # k_buffer.stride(0)
-    stride_k_head,  # k_buffer.stride(1)
-    stride_v_slot,  # v_buffer.stride(0)
-    stride_v_head,  # v_buffer.stride(1)
-    stride_decode_group,  # decode_slots.stride(0); stride(1) must be 1
-    stride_out_row,  # output.stride(0)
-    stride_out_head,  # output.stride(1)
-    stride_partial_split,  # partial_output.stride(0)
-    stride_partial_row,  # partial_output.stride(1)
-    stride_partial_head,  # partial_output.stride(2)
-    stride_lse_split,  # partial_lse.stride(0)
-    stride_lse_row,  # partial_lse.stride(1)
-    BEAM_WIDTH: tl.constexpr,  # beams per group, row_indices.shape[1]
-    Q_PER_KV: tl.constexpr,  # query heads per KV head
-    HEAD_DIM: tl.constexpr,  # q.shape[2]
+    stride_q_row,
+    stride_q_head,
+    stride_row_group,
+    stride_row_beam,
+    stride_k_slot,
+    stride_k_head,
+    stride_v_slot,
+    stride_v_head,
+    stride_decode_group,  # stride(1) must be 1
+    stride_out_row,
+    stride_out_head,
+    stride_partial_split,
+    stride_partial_row,
+    stride_partial_head,
+    stride_lse_split,
+    stride_lse_row,
+    BEAM_WIDTH: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     WRITE_PARTIALS: tl.constexpr,  # num_splits > 1; if false, partial_* are unused
-    BLOCK_M: tl.constexpr,  # beams per program
-    BLOCK_N: tl.constexpr,  # prompt tokens per block
-    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     WIDE_KV_OFFSETS: tl.constexpr,  # K/V offsets past 2^31: slot * stride needs 64 bits
 ):
     group = tl.program_id(0) // num_splits
@@ -258,20 +258,20 @@ def _merge_splits_kernel(
     row_indices,  # [groups, BEAM_WIDTH] int32, each beam's row of output
     output,  # [rows, Q_HEADS, HEAD_DIM]; only the rows in row_indices are written
     num_splits,  # splits the split-KV kernel wrote, more than 1
-    stride_partial_split,  # partial_output.stride(0); all strides are in elements
-    stride_partial_row,  # partial_output.stride(1)
-    stride_partial_head,  # partial_output.stride(2)
-    stride_lse_split,  # partial_lse.stride(0)
-    stride_lse_row,  # partial_lse.stride(1)
-    stride_row_group,  # row_indices.stride(0)
-    stride_row_beam,  # row_indices.stride(1)
-    stride_out_row,  # output.stride(0)
-    stride_out_head,  # output.stride(1)
-    BEAM_WIDTH: tl.constexpr,  # beams per group, row_indices.shape[1]
-    Q_HEADS: tl.constexpr,  # query heads, all merged by one program
-    HEAD_DIM: tl.constexpr,  # output.shape[2]
-    BLOCK_H: tl.constexpr,  # Q_HEADS rounded up to a power of 2
-    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    stride_partial_split,
+    stride_partial_row,
+    stride_partial_head,
+    stride_lse_split,
+    stride_lse_row,
+    stride_row_group,
+    stride_row_beam,
+    stride_out_row,
+    stride_out_head,
+    BEAM_WIDTH: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     local_row = tl.program_id(0)
     heads = tl.arange(0, BLOCK_H)
@@ -328,14 +328,9 @@ def _merge_splits_kernel(
 
 
 def resident_ctas_per_sm(kernel) -> int:
-    """CTAs of a compiled Triton kernel that one SM holds at once, as the driver counts.
-
-    On RTX PRO 6000 the split-KV kernel uses all 64K registers of an SM,
-    so this is 1 there; GPUs or compilers that need fewer registers per CTA fit more.
-    """
+    """CTAs of a compiled Triton kernel that one SM holds at once (1 on RTX PRO 6000)."""
     from cuda.bindings import driver
 
-    # Loads the module and sets kernel.function, which a first launch would also do.
     kernel._init_handles()
     error, count = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
         kernel.function, kernel.metadata.num_warps * 32, kernel.metadata.shared
@@ -356,8 +351,8 @@ _WAVE_CTAS: dict[tuple, int] = {}
 
 def wave_ctas(
     *,
-    key: tuple,  # what changes the compiled code: kernel, device, dtypes, constexprs
-    compile_kernel: Callable,  # compiles without launching (JITFunction.warmup)
+    key: tuple,
+    compile_kernel: Callable,
 ) -> int:
     wave = _WAVE_CTAS.get(key)
     if wave is None:
@@ -412,15 +407,13 @@ _KEPT_PARTIALS = _KeptPartials()
 
 def partial_buffers(
     device: torch.device,
-    output_numel: int,  # fp32 elements of the launch's partial outputs
-    lse_numel: int,  # fp32 elements of its partial log-sum-exps
+    output_numel: int,
+    lse_numel: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flat fp32 workspaces for a launch's partials, kept between eager launches.
+    """Flat fp32 partial workspaces, kept per thread and device between eager launches.
 
-    A thread's launches on one stream run in order, so each launch reads its
-    partials before the next one writes them: a thread keeps one pair per device,
-    as large as the largest launch so far on the pair's stream, and replaces it
-    when its current stream changes. The contents are undefined.
+    Launches on one stream run in order, so they can share one pair; the pair is
+    replaced when the current stream changes.
     """
     if torch.cuda.is_current_stream_capturing():
         # A graph replays the pointers it captured, so it must own its buffers.
@@ -448,10 +441,10 @@ def partial_buffers(
 
 
 def num_kv_splits(
-    num_tiles: int,  # programs without splits: groups * q_heads * beam blocks
-    wave: int,  # CTAs the GPU holds at once: SMs times CTAs per SM
+    num_tiles: int,
+    wave: int,
 ) -> int:
-    """Pick the prompt split count from static shapes only, so graphs keep it."""
+    """Static shapes only, so a graph keeps the split count."""
     best_splits, best_efficiency = 1, 0.0
     for splits in range(1, _MAX_SPLITS + 1):
         ctas = num_tiles * splits
@@ -464,14 +457,13 @@ def num_kv_splits(
 
 
 class _Plan(msgspec.Struct, frozen=True):
-    # The part of a call fixed by `launch_plan_key` and the split count asked for.
     grid: tuple[int, int, int]
-    args: tuple  # the kernel's arguments after softmax_scale: split count, strides
+    args: tuple
     constexprs: dict
-    partial_numel: int  # fp32 elements of the partial outputs; 0 with one split
-    lse_numel: int  # fp32 elements of the partial log-sum-exps
+    partial_numel: int  # 0 with one split
+    lse_numel: int
     merge_grid: tuple[int]
-    merge_args: tuple  # the merge kernel's arguments after output
+    merge_args: tuple
     merge_constexprs: dict
 
 
@@ -539,16 +531,13 @@ def _make_plan(
         output.stride(0),
         output.stride(1),
     )
-    # The partials are contiguous: [splits, rows, q_heads, head_dim] and
-    # [splits, rows, q_heads].
     partial_strides = (rows * q_heads * head_dim, q_heads * head_dim, head_dim) + (
         rows * q_heads,
         q_heads,
     )
 
     if num_splits is None:
-        # Any split count above 1 compiles to the same kernel: probe it with the
-        # partials' dtype, before they are allocated.
+        # Any split count above 1 compiles to the same kernel.
         wave = wave_ctas(
             key=(q.device.index, q.dtype, k_buffer.dtype)
             + tuple(sorted(constexprs.items())),
@@ -616,28 +605,23 @@ def _make_plan(
 
 
 def shared_context_attention_split_kv(
-    q: torch.Tensor,  # [rows, q_heads, head_dim]
-    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
-    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
-    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
-    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
-    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
-    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
-    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_slots: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
     *,
-    output: torch.Tensor | None = None,  # like q; allocated when None
-    softmax_scale: float,  # scales q.k before the softmax
-    num_splits: Optional[int] = None,  # prompt splits; None picks num_kv_splits
+    output: torch.Tensor | None = None,
+    softmax_scale: float,
+    num_splits: Optional[int] = None,  # None picks num_kv_splits
 ) -> torch.Tensor:
-    """Shared prompt and per-beam suffix attention, split along the prompt.
-
-    Same contract as `shared_context_attention`: `row_indices` [groups, beam_width]
-    maps each beam to its row of Q and of the output, and `decode_slots` is
-    [groups, capacity * beam_width], step-major. Only those rows are written.
-    """
+    """`shared_context_attention` with the prompt split across programs; same contract."""
     if output is None:
         output = torch.empty_like(q)
-    # The checks and the plan repeat for every layer of a decode step.
+    # Cached: every layer of a decode step repeats the checks and the plan.
     key = launch_plan_key(
         q,
         k_buffer,
@@ -671,7 +655,6 @@ def shared_context_attention_split_kv(
             q.device, plan.partial_numel, plan.lse_numel
         )
     else:
-        # Unread with one split, which writes the output itself.
         partial_output = partial_lse = output
 
     _shared_context_split_kv_kernel[plan.grid](

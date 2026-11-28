@@ -26,7 +26,7 @@ VOCAB = TOKEN_START + 3 * CODEBOOK + 7
 
 
 class _Req(SimpleNamespace):
-    """A Req stand-in that BeamGroup can hold weakly, as it holds a real Req."""
+    """Weak-referenceable, as BeamGroup holds a real Req."""
 
 
 class _ReqToTokenPool:
@@ -132,14 +132,13 @@ def _forward(mode, rows, width, with_normalizer):
 
 
 def _run_request_steps(coordinator, reqs):
-    # Prefill: the leaders' first selection and member spawn.
     batch = SimpleNamespace(beam_tail=None, forward_mode=ForwardMode.EXTEND, reqs=reqs)
     output, forward_batch = _forward(ForwardMode.EXTEND, NUM_GROUPS, VOCAB, False)
     capture_pre_sample_logits(batch, forward_batch, output)
     for pos, req in enumerate(reqs):
         coordinator.select_leader_prefill(req, pos, output, tick=0)
 
-    # Two decode steps, the second final, as the batch tail lays out the rows.
+    # Two decode steps, the second final.
     for tick in (1, 2):
         for req in reqs:
             req.kv.kv_committed_len = PROMPT_LEN + tick
@@ -166,10 +165,8 @@ def _run_request_steps(coordinator, reqs):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestBeamLaunchHalf(CustomTestCase):
     def test_beam_launch_half_never_syncs_the_host(self):
-        """Run-ahead: from the forward's logits to the relayed tokens, the beam
-        launch half (capture, selection, member spawn, KV remap, relay) issues no
-        host sync, so the CPU queues it while the forward still runs."""
-        # Warm-up: kernel compilation and first allocations.
+        """From the forward's logits to the relayed tokens, the launch half
+        (capture, selection, spawn, KV remap, relay) issues no host sync."""
         _run_request_steps(*_setup())
         torch.cuda.synchronize()
         coordinator, reqs = _setup()

@@ -73,8 +73,7 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
 
     batch.req_pool_indices = torch.cat([batch.req_pool_indices, *tails])
     batch.req_pool_indices_cpu = torch.cat([batch.req_pool_indices_cpu, *tails_cpu])
-    # output_size: without it, device repeats are read back to size the output,
-    # which syncs the host while the overlap scheduler builds the next batch.
+    # output_size avoids a device-to-host read of the repeat counts (overlap host sync).
     batch.seq_lens = torch.cat(
         [
             batch.seq_lens,

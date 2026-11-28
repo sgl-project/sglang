@@ -758,10 +758,8 @@ class TpModelWorker(BaseTpWorker):
                 return batch_result
 
             if is_unsampled(logits_output):
-                # A beam-only batch produced its next tokens through the beam
-                # coordinator, not the sampler. This host placeholder only keeps
-                # the result's shape, and having it is what gates the scheduler's
-                # relay.
+                # Beam coordinator selects the tokens; this placeholder sets
+                # has_sampled_token_ids, which gates the scheduler's relay.
                 batch_result.next_token_ids = torch.zeros(
                     len(batch.reqs), dtype=torch.int64
                 )

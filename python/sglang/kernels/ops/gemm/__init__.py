@@ -208,8 +208,7 @@ register_kernel(
         capabilities=_SM10X,
     )
 )
-# Same contract as gemm.dual_gemm_swiglu, for SM120; a separate op because the
-# registry holds one spec per (op, backend) and both are CuTe DSL.
+# Same contract as gemm.dual_gemm_swiglu; a separate op because the registry holds one spec per (op, backend).
 register_kernel(
     KernelSpec(
         op="gemm.quack_swiglu_gemm",

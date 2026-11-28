@@ -1775,7 +1775,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_QUACK_SWIGLU_GEMM</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM120 (RTX Blackwell), fuse SiLU-and-mul into the gate/up GEMM of unquantized BF16 dense MLPs that dispatch through <code>DualGemm</code> (Llama, Qwen2, Qwen3 and models built on their MLPs). Deterministic inference, on-policy RL, torch.compile, LoRA-wrapped layers and tensor-parallel sequence parallelism keep the unfused path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM120 (RTX Blackwell), fuse SiLU-and-mul into the gate/up GEMM of unquantized BF16 dense MLPs that dispatch through <code>DualGemm</code>. Deterministic inference, on-policy RL, torch.compile, LoRA and sequence parallelism keep the unfused path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

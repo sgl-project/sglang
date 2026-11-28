@@ -226,11 +226,9 @@ class GenerationBatchResult:
 
     @property
     def has_sampled_token_ids(self) -> bool:
-        """True when this iter produced next tokens: sampled, or selected by the
-        beam coordinator (a host placeholder then stands in for the sampler's ids,
-        and its presence is what gates the scheduler's relay). False when none
-        were produced this rank/split (a non-last PP rank or a non-final prefill
-        split)."""
+        """True when this iter produced next tokens (sampled, or a beam placeholder);
+        False when none were produced this rank/split (a non-last PP rank or a
+        non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
     def get_num_generated_tokens(self, batch_size: int) -> int:

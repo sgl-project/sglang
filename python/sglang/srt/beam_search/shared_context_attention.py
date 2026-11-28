@@ -55,8 +55,6 @@ def enabled() -> bool:
 
 def resolve_attention_kernel() -> Callable:
     """The kernel the attention backend runs for every bucket, picked at its startup."""
-    # One contract. Split-KV also spreads the prompt over the SMs that a few
-    # groups leave idle, at the cost of a second launch for the merge.
     if envs.SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV.get():
         from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
             shared_context_attention_split_kv,

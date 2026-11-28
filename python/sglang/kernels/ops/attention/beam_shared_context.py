@@ -11,11 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Native Triton shared-context attention for wide beam decoding.
-
-The online-softmax steps and the input checks are shared with the opt-in
-split-KV kernel (beam_shared_context_split_kv.py).
-"""
+"""Native Triton shared-context attention for wide beam decoding."""
 
 from __future__ import annotations
 
@@ -26,9 +22,9 @@ import triton.language as tl
 
 @triton.jit
 def empty_softmax_state(
-    beam_mask,  # [BLOCK_M] bool, the tile's beams that exist
-    BLOCK_M: tl.constexpr,  # beams per tile
-    BLOCK_D: tl.constexpr,  # head_dim rounded up to a power of 2
+    beam_mask,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     max_values = tl.where(beam_mask, -float("inf"), 0.0)
     normalizers = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -38,14 +34,13 @@ def empty_softmax_state(
 
 @triton.jit
 def attend_prompt_block(
-    scores,  # [BLOCK_M, BLOCK_N] fp32 unscaled q.k, -inf where masked
-    v_values,  # [BLOCK_N, BLOCK_D] V of the block's prompt tokens
-    max_values,  # [BLOCK_M] fp32 running max of the unscaled scores
-    normalizers,  # [BLOCK_M] fp32 running softmax denominator
-    accumulator,  # [BLOCK_M, BLOCK_D] fp32 weighted sum of V, not yet normalized
-    softmax_scale_log2,  # softmax_scale * log2(e), for exp2
+    scores,  # unscaled q.k, -inf where masked
+    v_values,
+    max_values,  # running max of the unscaled scores
+    normalizers,
+    accumulator,  # not yet normalized
+    softmax_scale_log2,
 ):
-    # Online softmax step over a block of prompt tokens; masked scores are -inf.
     new_max = tl.maximum(max_values, tl.max(scores, axis=1))
     previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
     probabilities = tl.exp2((scores - new_max[:, None]) * softmax_scale_log2)
@@ -59,14 +54,13 @@ def attend_prompt_block(
 
 @triton.jit
 def attend_beam_token(
-    scores,  # [BLOCK_M] fp32 unscaled q.k with each beam's own token, -inf if masked
-    v_values,  # [BLOCK_M, BLOCK_D] V of each beam's own token
-    max_values,  # [BLOCK_M] fp32 running max of the unscaled scores
-    normalizers,  # [BLOCK_M] fp32 running softmax denominator
-    accumulator,  # [BLOCK_M, BLOCK_D] fp32 weighted sum of V, not yet normalized
-    softmax_scale_log2,  # softmax_scale * log2(e), for exp2
+    scores,  # unscaled q.k with each beam's own token, -inf if masked
+    v_values,
+    max_values,  # running max of the unscaled scores
+    normalizers,
+    accumulator,  # not yet normalized
+    softmax_scale_log2,
 ):
-    # Online softmax step over one decode token per beam; masked scores are -inf.
     new_max = tl.maximum(max_values, scores)
     previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
     current_scale = tl.exp2((scores - new_max) * softmax_scale_log2)
@@ -89,30 +83,30 @@ def _shared_context_attention_kernel(
     decode_slots,  # [groups, MAX_DECODE * BEAM_WIDTH] int32 KV slots, step-major
     decode_lens,  # [groups] int32, decode steps each beam attends to
     output,  # like q; only the rows in row_indices are written
-    softmax_scale,  # float, scales q.k before the softmax
-    stride_q_row,  # q.stride(0); all strides are in elements
-    stride_q_head,  # q.stride(1)
-    stride_q_dim,  # q.stride(2)
-    stride_row_group,  # row_indices.stride(0)
-    stride_row_beam,  # row_indices.stride(1)
-    stride_k_slot,  # k_buffer.stride(0)
-    stride_k_head,  # k_buffer.stride(1)
-    stride_k_dim,  # k_buffer.stride(2)
-    stride_v_slot,  # v_buffer.stride(0)
-    stride_v_head,  # v_buffer.stride(1)
-    stride_v_dim,  # v_buffer.stride(2)
-    stride_decode_group,  # decode_slots.stride(0)
-    stride_decode_token,  # decode_slots.stride(1)
-    stride_out_row,  # output.stride(0)
-    stride_out_head,  # output.stride(1)
-    stride_out_dim,  # output.stride(2)
-    BEAM_WIDTH: tl.constexpr,  # beams per group, row_indices.shape[1]
-    Q_PER_KV: tl.constexpr,  # query heads per KV head
-    HEAD_DIM: tl.constexpr,  # q.shape[2]
-    MAX_DECODE: tl.constexpr,  # decode_slots.shape[1] // BEAM_WIDTH, the step capacity
-    BLOCK_M: tl.constexpr,  # beams per program
-    BLOCK_N: tl.constexpr,  # prompt tokens per block
-    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    softmax_scale,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_row_group,
+    stride_row_beam,
+    stride_k_slot,
+    stride_k_head,
+    stride_k_dim,
+    stride_v_slot,
+    stride_v_head,
+    stride_v_dim,
+    stride_decode_group,
+    stride_decode_token,
+    stride_out_row,
+    stride_out_head,
+    stride_out_dim,
+    BEAM_WIDTH: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MAX_DECODE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     group = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -257,14 +251,14 @@ def _shared_context_attention_kernel(
 
 
 def check_shared_context_inputs(
-    q: torch.Tensor,  # [rows, q_heads, head_dim]
-    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim]
-    v_buffer: torch.Tensor,  # same shape as k_buffer
-    row_indices: torch.Tensor,  # [groups, beam_width]
-    context_cu_seqlens: torch.Tensor,  # [groups + 1]
-    decode_slots: torch.Tensor,  # [groups, capacity * beam_width]
-    decode_lens: torch.Tensor,  # [groups]
-    output: torch.Tensor | None,  # like q, or None to allocate one
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor | None,
 ) -> None:
     if q.ndim != 3:
         raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
@@ -291,17 +285,17 @@ def check_shared_context_inputs(
 
 
 def shared_context_attention(
-    q: torch.Tensor,  # [rows, q_heads, head_dim]
-    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
-    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
-    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
-    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
-    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
-    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
-    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_slots: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
     *,
-    output: torch.Tensor | None = None,  # like q; allocated when None
-    softmax_scale: float,  # scales q.k before the softmax
+    output: torch.Tensor | None = None,
+    softmax_scale: float,
 ) -> torch.Tensor:
     check_shared_context_inputs(
         q,

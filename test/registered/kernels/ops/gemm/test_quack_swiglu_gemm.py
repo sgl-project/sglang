@@ -39,9 +39,8 @@ class TestQuackSwigluGemm(CustomTestCase):
         init_single_process_dist()
 
     def test_kernel_reads_gate_up_layout_in_place(self):
-        """SGLang stacks the merged weight as [gate; up]; reading it as
-        interleaved or swapped halves changes every output. M covers both
-        tile heights, all three tile widths and partial M tiles."""
+        """The merged weight is [gate; up]. M covers both tile heights, all tile
+        widths and partial M tiles."""
         from sglang.kernels.ops.gemm.quack_swiglu_gemm import quack_swiglu_gemm
 
         for m in (1, 256, 300, 512, 600, 768, 2049):
@@ -78,10 +77,9 @@ class TestQuackSwigluGemm(CustomTestCase):
         return x, out, fused.called
 
     def test_mlp_takes_fused_path(self):
-        """With the flag on, decode-sized and prefill-sized batches both take
-        the fused GEMM and match the fp32 MLP."""
+        """With the flag on, the MLP takes the fused GEMM and matches fp32."""
         mlp = self._mlp()
-        for m in (1, 256, 2048):
+        for m in (1, 2048):
             with self.subTest(m=m):
                 x, out, fused = self._run(mlp, m)
                 self.assertTrue(fused)

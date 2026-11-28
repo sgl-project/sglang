@@ -1028,8 +1028,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
         self._paged_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
-        # One-launch plans keyed on the exact max_seqlen_k: prefill, and the decode
-        # shapes that _keys_on_kv_blocks leaves out.
+        # Keyed on the exact max_seqlen_k: prefill and decode shapes not in _keys_on_kv_blocks.
         self._paged_exact_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
@@ -1322,10 +1321,9 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         head_dim_v: int,
         effective_q_rows: int,
     ) -> bool:
-        """Shapes whose plans key on KV blocks instead of the exact max_seqlen_k.
+        """Shapes whose plans key on KV blocks, not the exact max_seqlen_k.
 
-        select_config and resolve_plan read it only as KV blocks under the chosen tile;
-        drop a shape if that changes.
+        Valid only while select_config and resolve_plan read it as KV blocks.
         """
         head_dims = (head_dim, head_dim_v)
         return (
@@ -1334,8 +1332,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     @staticmethod
     def _paged_exact_key(base_key: tuple, max_seqlen_k: int) -> tuple:
-        # get_fwd_tile_size reads the exact seqlen_k, total rows and batch; the
-        # base key holds the rest, so prefill plans key on max_seqlen_k itself.
+        # get_fwd_tile_size reads the exact seqlen_k, so prefill keys on it.
         return (*base_key, max_seqlen_k)
 
     def _paged_decode_plan(
@@ -1551,7 +1548,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
         )
-        # A prefill plan replays one launch; SplitKV prefill keeps the generic path.
+        # SplitKV prefill keeps the generic path.
         if not keys_on_kv_blocks and actual_num_splits != 1:
             return
         base_key = self._paged_base_key(

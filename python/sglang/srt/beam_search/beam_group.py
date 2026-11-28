@@ -124,9 +124,8 @@ class BeamGroup:
 
     @property
     def leader(self) -> Optional[Req]:
-        """The leader Req, held weakly: the Req owns its group through
-        req.beam_group, and a strong back-reference would make every finished
-        request cyclic garbage that only a full GC pass frees."""
+        """Held weakly: the Req owns its group, and a strong back-reference would
+        make finished requests cyclic garbage."""
         return None if self._leader is None else self._leader()
 
     @leader.setter
