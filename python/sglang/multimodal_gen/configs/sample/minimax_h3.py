@@ -445,9 +445,57 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                 )
 
 
+@dataclass
+class PiH3SamplingParams(MiniMaxH3SamplingParams):
+    """pi-H3: two or four Euler steps on the adapters' trained knots."""
+
+    num_inference_steps: int = 4
+    quality: str = "lossless"
+
+    @staticmethod
+    def trained_steps(model_variant: str | None) -> int:
+        """The 2step variants take two DiT forwards, the root and 4step four."""
+        variant = (model_variant or "4step").strip().lower()
+        return 2 if variant.startswith("2step") else 4
+
+    def _adjust(self, server_args) -> None:
+        # the step count is a property of the served variant
+        if "num_inference_steps" not in getattr(self, "_explicit_fields", set()):
+            variant = getattr(server_args, "model_variant", None)
+            subfolder = getattr(server_args, "model_subfolder", None)
+            if variant is None and subfolder:
+                # a variant picked by directory: 2step, 2step_vae, ...
+                variant = os.path.basename(os.path.normpath(subfolder))
+            self.num_inference_steps = self.trained_steps(variant)
+        super()._adjust(server_args)
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps not in (2, 4):
+            raise ValueError(
+                "pi-H3 adapters are distilled for 2 or 4 steps (the 2step and "
+                f"4step variants); got num_inference_steps={self.num_inference_steps}"
+            )
+        if self.task is not None and self.task.strip().lower() not in (
+            "t2va",
+            "fl2va",
+        ):
+            raise ValueError(
+                f"pi-H3 serves t2va and fl2va only (got task={self.task!r})"
+            )
+        # the adapters were trained at video shift 12 / audio shift 3
+        for name, trained in (("flow_shift", 12.0), ("audio_flow_shift", 3.0)):
+            value = getattr(self, name)
+            if value is not None and float(value) != trained:
+                raise ValueError(
+                    f"pi-H3 adapters were trained at {name}={trained:g}; got {value}"
+                )
+
+
 __all__ = [
     "FastH3OmniSamplingParams",
     "FastH3SamplingParams",
     "MiniMaxH3SamplingParams",
+    "PiH3SamplingParams",
     "PikaH3FlexSamplingParams",
 ]

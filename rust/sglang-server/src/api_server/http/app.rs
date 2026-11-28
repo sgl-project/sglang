@@ -15,9 +15,10 @@ use super::{
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
-use crate::api_server::handlers::{CoreHandle, HiCacheManager};
+use crate::api_server::handlers::{CoreHandle, HiCacheManager, VlmWarmup, VlmWarmupPrompt};
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
+use crate::message::multimodal::MmItem;
 use crate::message::request::GenerationPolicy;
 use crate::utils::environ;
 
@@ -39,7 +40,8 @@ pub(super) struct AppState {
 }
 
 /// Every listener warms its own rank, as Python's `_execute_server_warmup`
-/// warms the server, and health stays 503 until the warmup settles. A failed
+/// warms the server, and health stays 503 until the warmup settles. A VLM's
+/// warmup (`vlm`, see [`vlm_warmup`]) generates from its image. A failed
 /// or timed-out warmup takes the server down as Python's does: the error goes
 /// to `startup_failure`, which `Server.wait_startup_failure` hands to the
 /// launching process. Python's PD exception holds here too: a warmup the
@@ -55,32 +57,38 @@ pub(super) struct AppState {
 async fn startup_warmup(
     core: CoreHandle,
     server_args: Arc<ServerArgs>,
+    vlm: Option<Result<VlmWarmup, String>>,
     timeout: Duration,
     startup_failure: flume::Sender<String>,
 ) {
     core.custom_warmups_finished().await;
     if !core.is_ready() {
-        let error = match tokio::time::timeout(
-            timeout,
-            core.warm_up(server_args.skip_tokenizer_init),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                core.mark_ready();
-                tracing::info!("The server is fired up and ready to roll!");
-                None
-            }
-            Ok(Err(e)) if server_args.is_disaggregation() => {
-                tracing::info!(
-                    "Disaggregation warmup failed (mode={:?}), error: {e}",
-                    server_args.disaggregation_mode
-                );
-                core.mark_ready();
-                None
-            }
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(_) => Some(format!("timed out after {timeout:?}")),
+        // A warmup prompt the chat template cannot render fails the startup,
+        // P/D included: the server is misconfigured.
+        let error = match vlm.transpose() {
+            Err(e) => Some(e),
+            Ok(vlm) => match tokio::time::timeout(
+                timeout,
+                core.warm_up(server_args.skip_tokenizer_init, vlm),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    core.mark_ready();
+                    tracing::info!("The server is fired up and ready to roll!");
+                    None
+                }
+                Ok(Err(e)) if server_args.is_disaggregation() => {
+                    tracing::info!(
+                        "Disaggregation warmup failed (mode={:?}), error: {e}",
+                        server_args.disaggregation_mode
+                    );
+                    core.mark_ready();
+                    None
+                }
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some(format!("timed out after {timeout:?}")),
+            },
         };
         if let Some(error) = error {
             tracing::error!("Initialization failed. warmup error: {error}");
@@ -91,6 +99,45 @@ async fn startup_warmup(
     if let Err(e) = core.freeze_gc(server_args.gc_threshold.clone()).await {
         tracing::error!(error = %e, "post-warmup freeze_gc failed");
     }
+}
+
+/// The startup warmup of a VLM, for which the launcher sends its image
+/// (`vlm_warmup_image_base64`): the prompt is the one the launcher rendered,
+/// or the served chat template's rendering of Python's warmup message.
+fn vlm_warmup(
+    server_args: &ServerArgs,
+    chat_formatter: Option<&openai::ChatFormatter>,
+) -> Option<Result<VlmWarmup, String>> {
+    let image = server_args.vlm_warmup_image_base64.as_ref()?;
+    let image_url = format!("data:image/png;base64,{image}");
+    let prompt = match &server_args.vlm_warmup_prompt {
+        Some(prompt) => Ok(VlmWarmupPrompt::Text(prompt.clone())),
+        None => chat_formatter
+            .ok_or_else(|| "this model has no usable chat template".to_string())
+            .and_then(|formatter| {
+                let request = serde_json::from_value(serde_json::json!({
+                    "model": server_args.served_model_name,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": "Describe the image."},
+                        ],
+                    }],
+                }))
+                .map_err(|e| e.to_string())?;
+                openai::render_chat_prompt(
+                    formatter,
+                    &request,
+                    &server_args.default_chat_template_kwargs,
+                )
+            })
+            .map(|rendered| VlmWarmupPrompt::Rendered(Box::new(rendered))),
+    };
+    Some(prompt.map(|prompt| VlmWarmup {
+        prompt,
+        image: MmItem::Source(image_url),
+    }))
 }
 
 /// Python's warmup request timeout: `SGLANG_WARMUP_TIMEOUT` seconds when
@@ -145,6 +192,7 @@ pub async fn serve(
     tokio::spawn(startup_warmup(
         state.core.clone(),
         server_args.clone(),
+        vlm_warmup(&server_args, state.chat_formatter.as_ref()),
         warmup_timeout(
             environ::env_f64("SGLANG_WARMUP_TIMEOUT", -1.0),
             server_args.is_disaggregation(),
@@ -274,6 +322,7 @@ mod tests {
     use super::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
     use crate::message::config::DisaggregationMode;
+    use crate::message::request::RequestKind;
     use crate::message::response::{ChunkEvent, ResponseItem};
     use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -315,6 +364,7 @@ mod tests {
         startup_warmup(
             core.clone(),
             Arc::new(ServerArgs::default()),
+            None,
             Duration::from_millis(10),
             failure_tx,
         )
@@ -369,6 +419,7 @@ mod tests {
             let warmup = tokio::spawn(startup_warmup(
                 core.clone(),
                 server_args.clone(),
+                None,
                 Duration::from_secs(60),
                 failure_tx,
             ));
@@ -455,6 +506,7 @@ mod tests {
         let warmup = tokio::spawn(startup_warmup(
             core.clone(),
             Arc::new(ServerArgs::default()),
+            None,
             Duration::from_secs(60),
             failure_tx,
         ));
@@ -480,5 +532,112 @@ mod tests {
         warmup.await.unwrap();
         assert!(core.is_serving());
         assert!(failure_rx.is_empty());
+    }
+
+    /// A VLM warms up from its image and the launcher's prompt or, without
+    /// one, the served template's rendering of Python's warmup message, with
+    /// the fake bootstrap under P/D; with neither, the startup fails, P/D
+    /// included.
+    #[tokio::test]
+    async fn vlm_startup_warmup_generates_from_the_image() {
+        let formatter = super::openai::test_utils::checkpoint_formatter(
+            &serde_json::json!({}),
+            "{% for m in messages %}{% for p in m['content'] %}\
+             {% if p['type'] == 'image' %}<image>{% else %}{{ p['text'] }}{% endif %}\
+             {% endfor %}{% endfor %}",
+        );
+        for (prompt, formatter, pd) in [
+            (Some("<image>Describe the image."), None, false),
+            (None, Some(&formatter), true),
+            (None, None, true),
+        ] {
+            let case = format!("prompt={prompt:?} pd={pd}");
+            let server_args = Arc::new(ServerArgs {
+                vlm_warmup_image_base64: Some("UE5H".into()),
+                vlm_warmup_prompt: prompt.map(str::to_owned),
+                disaggregation_mode: if pd {
+                    DisaggregationMode::Prefill
+                } else {
+                    DisaggregationMode::Null
+                },
+                ..Default::default()
+            });
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: false,
+                    is_disaggregation: pd,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    metadata: CoreMetadata::from(server_args.as_ref()),
+                    metrics: None,
+                    request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            );
+            let (failure_tx, failure_rx) = flume::bounded(1);
+            let warmup = tokio::spawn(startup_warmup(
+                core.clone(),
+                server_args.clone(),
+                vlm_warmup(&server_args, formatter),
+                Duration::from_secs(60),
+                failure_tx,
+            ));
+            if prompt.is_none() && formatter.is_none() {
+                warmup.await.unwrap();
+                assert_eq!(
+                    failure_rx.try_recv().unwrap(),
+                    "this model has no usable chat template"
+                );
+                assert!(intake_rx.is_empty(), "{case}");
+                continue;
+            }
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{case}: the warmup generation must come first");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Generate(generate) = &request.kind else {
+                panic!("{case}: expected a generation");
+            };
+            let mm = generate.mm.as_ref().expect("the warmup image");
+            assert_eq!(
+                mm.image_data,
+                [MmItem::Source("data:image/png;base64,UE5H".into())],
+                "{case}"
+            );
+            match prompt {
+                Some(prompt) => assert_eq!(generate.text.as_deref(), Some(prompt), "{case}"),
+                None => assert_eq!(
+                    generate
+                        .chat_prompt
+                        .as_ref()
+                        .map(|chat| chat.prompt.as_str()),
+                    Some("<image>Describe the image."),
+                    "{case}"
+                ),
+            }
+            assert_eq!(
+                generate.bootstrap_host.as_deref(),
+                pd.then_some("2.2.2.2"),
+                "{case}"
+            );
+            request
+                .sink
+                .try_send(ResponseItem::Done(ChunkEvent::default()))
+                .unwrap();
+            let TmEvent::OneWay { queued, .. } = intake_rx.recv_async().await.unwrap() else {
+                panic!("{case}: expected the FreezeGCReq");
+            };
+            queued.send(Ok(())).unwrap();
+            warmup.await.unwrap();
+            assert!(core.is_ready(), "{case}");
+        }
     }
 }

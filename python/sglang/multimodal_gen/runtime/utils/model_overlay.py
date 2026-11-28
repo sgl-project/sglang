@@ -68,6 +68,11 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_revision": "2d8d5e4d81d2ad0ba4b0bbcf7049231bfbe3e9c2",
         "source_revision": "3ff166447d5edb1406107ab8370c42000ce173e4",
     },
+    "Lakonik/pi-H3": {
+        "overlay_repo_id": "Niehen6174/pi-H3-overlay",
+        "overlay_revision": "b3a0e7fd604b449e8f7a5cd4621eecc0cc3d7e5d",
+        "source_revision": "4a864589b0fac3d14768f932c930c4dcf1a17b56",
+    },
 }
 
 
