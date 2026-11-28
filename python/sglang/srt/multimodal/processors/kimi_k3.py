@@ -499,6 +499,8 @@ class KimiK3ImageProcessor(
 ):
     models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
+    # Preserve alpha for checkpoint-configured compositing after resize.
+    artifact_discard_alpha_channel = False
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
     # image dependency is installed and otherwise falls back to PIL.
