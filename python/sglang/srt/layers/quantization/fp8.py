@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     gfx1250_mxfp8_prepare_weight,
     input_to_float8,
     mxfp8_group_quantize,
@@ -118,6 +119,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -144,6 +146,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx942_supported = is_gfx942_supported()
 _is_gfx95_supported = is_gfx95_supported()
 
 if _is_hip:
@@ -924,6 +927,45 @@ class Fp8LinearMethod(LinearMethodBase):
                     "BF16 weight caches are active: captured CUDA graphs retain "
                     "these derived weights. Restart with "
                     "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                )
+        if (
+            _is_gfx942_supported
+            and weight.is_cuda
+            and weight.dtype == torch.float8_e4m3fnuz
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and not self.use_marlin
+            and not getattr(layer, "keep_plain_weight_layout", False)
+        ):
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            # Set from the config alone, so all ranks holding such layers reject
+            # together; a reload cannot re-normalize FNUZ weights.
+            layer._derived_weight_cache_error = (
+                "Online weight updates are not supported for group32 FP8 "
+                "weights on gfx942: reloads cannot re-normalize FNUZ weights, "
+                "and captured CUDA graphs retain any BF16 expansions."
+            )
+            # FNUZ normalization halves the E4M3 values and doubles the scales, so the
+            # exact range above shifts by one; reject non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-116)
+                & (weight_scale <= 2.0**120)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            # Built under batch-invariant mode too: that mode routes F.linear through
+            # its own mm/addmm, so a later-loaded draft model stays on this path.
+            if (
+                not get_fp8_gemm_runner_backend().is_triton()
+                and exact_bf16_scales.item()
+            ):
+                # Group32 FP8 GEMMs on gfx942 are K-loop bound; serve BF16 inputs from
+                # a BF16 expansion, keeping the FP8 weights for pre-quantized inputs.
+                layer.register_buffer(
+                    "_block_fp8_bf16_weight",
+                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
+                    persistent=False,
                 )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
