@@ -3,6 +3,7 @@ top blocks, the top-k within them, and the sorted paged top-k (the HIP side of c
 
 from __future__ import annotations
 
+import logging
 from typing import List, NamedTuple, Optional
 
 import torch
@@ -11,9 +12,124 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import plan_topk_v2, topk_transform_paged_v2
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 # the k the block top-k kernel path is taken for; any other k takes torch.topk
 _BLOCK_TOPK_K = 2048
+
+
+_RADIX_TOPK_K = 512
+
+
+def _radix_topk_applies(scores, seq_lens, page_indices) -> bool:
+    return (
+        envs.SGLANG_HIP_DSV41_RADIX_TOPK.get()
+        and scores.shape[0] >= envs.SGLANG_HIP_DSV41_RADIX_TOPK_MIN_ROWS.get()
+        and scores.shape[1] >= envs.SGLANG_HIP_DSV41_RADIX_TOPK_MIN_WIDTH.get()
+        and page_indices.shape[1] == _RADIX_TOPK_K
+        and scores.dtype == torch.float32
+        and seq_lens.dtype == torch.int32
+        and page_indices.is_contiguous()
+    )
+
+
+@triton.jit
+def _page_map_kernel(
+    raw_ptr,
+    page_table_ptr,
+    out_ptr,
+    stride_pt,
+    PAGE_SIZE: tl.constexpr,
+    K: tl.constexpr,
+    HAS_TABLE: tl.constexpr,
+):
+    """Row r: raw selected positions -> paged slots page_table[r, raw // PAGE_SIZE] * PAGE_SIZE
+    + raw % PAGE_SIZE; -1 padding stays -1."""
+    r = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, K)
+    raw = tl.load(raw_ptr + r * K + offs)
+    valid = raw >= 0
+    if HAS_TABLE:
+        page = tl.load(
+            page_table_ptr + r * stride_pt + raw // PAGE_SIZE, mask=valid, other=0
+        )
+        slot = page * PAGE_SIZE + raw % PAGE_SIZE
+    else:
+        slot = raw
+    tl.store(out_ptr + r * K + offs, tl.where(valid, slot, -1))
+
+
+def _radix_topk_paged(
+    scores, seq_lens, page_table, page_indices, page_size, raw_indices
+) -> None:
+    from aiter.ops.flydsl.topk.topk_per_row import flydsl_radix_topk_one_block
+
+    rows = scores.shape[0]
+    raw = (
+        raw_indices
+        if raw_indices is not None and raw_indices.is_contiguous()
+        else torch.empty_like(page_indices)
+    )
+    flydsl_radix_topk_one_block(
+        scores,
+        None,
+        seq_lens.contiguous(),
+        raw,
+        None,
+        rows,
+        scores.stride(0),
+        1,
+        k=_RADIX_TOPK_K,
+        stable=True,
+        is_decode=True,
+        next_n=1,
+        plane_width=scores.shape[1],
+    )
+    if raw_indices is not None and raw is not raw_indices:
+        raw_indices.copy_(raw)
+    if rows:
+        _page_map_kernel[(rows,)](
+            raw,
+            page_table if page_table is not None else raw,
+            page_indices,
+            page_table.stride(0) if page_table is not None else 0,
+            PAGE_SIZE=page_size,
+            K=_RADIX_TOPK_K,
+            HAS_TABLE=page_table is not None,
+            num_warps=2,
+        )
+
+
+def _debug_compare_radix_topk(
+    scores, seq_lens, page_table, page_indices, page_size, raw_indices
+) -> None:
+    """Both top-k paths on the same call; logs rows whose sorted raw / paged sets differ."""
+    rows = scores.shape[0]
+    ref_page = torch.empty_like(page_indices)
+    ref_raw = torch.empty_like(page_indices)
+    topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        ref_page,
+        page_size,
+        plan_topk_v2(seq_lens),
+        ref_raw,
+    )
+    new_page = torch.empty_like(page_indices)
+    new_raw = torch.empty_like(page_indices)
+    _radix_topk_paged(scores, seq_lens, page_table, new_page, page_size, new_raw)
+    raw_bad = (ref_raw.sort(1).values != new_raw.sort(1).values).any(1).sum().item()
+    page_bad = (ref_page.sort(1).values != new_page.sort(1).values).any(1).sum().item()
+    logger.warning(
+        "radix top-k debug: rows %d width %d, raw-set rows differ %d, paged-set rows differ %d",
+        rows,
+        scores.shape[1],
+        raw_bad,
+        page_bad,
+    )
 
 
 def topk_transform_paged_hip(
@@ -24,8 +140,19 @@ def topk_transform_paged_hip(
     page_size: int,
     raw_indices: Optional[torch.Tensor],
 ) -> None:
-    """topk_transform_paged (rows unordered) on the top-k v2 kernel."""
+    """topk_transform_paged (rows unordered) on the top-k v2 kernel, or from MIN_ROWS rows on
+    aiter's stable one-block radix top-k (SGLANG_HIP_DSV41_RADIX_TOPK): the same index set a
+    row (both keep the smallest indices among ties), in another order."""
     assert scores.stride(0) % 4 == 0, "top-k v2 needs 16-byte aligned score rows"
+    if _radix_topk_applies(scores, seq_lens, page_indices):
+        if envs.SGLANG_DEBUG_DSV41_RADIX_TOPK.get():
+            _debug_compare_radix_topk(
+                scores, seq_lens, page_table, page_indices, page_size, raw_indices
+            )
+        _radix_topk_paged(
+            scores, seq_lens, page_table, page_indices, page_size, raw_indices
+        )
+        return
     topk_transform_paged_v2(
         scores,
         seq_lens,

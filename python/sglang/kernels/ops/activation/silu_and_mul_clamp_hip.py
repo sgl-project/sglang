@@ -14,6 +14,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     fp8_grid_quant,
     fp8_grid_round,
 )
+from sglang.srt.environ import envs
 
 
 @triton.jit
@@ -88,6 +89,20 @@ def silu_and_mul_clamp_triton(
     assert gate_up.stride(1) == 1, "the kernel reads the up half at gate + inter_size"
     M, N = gate_up.shape
     inter_size = N // 2
+    if (
+        emit_fp8
+        and envs.SGLANG_HIP_SILU_MXFP8_FLYDSL.get()
+        and M >= envs.SGLANG_HIP_SILU_MXFP8_FLYDSL_MIN_M.get()
+        and gate_up.dtype == torch.bfloat16
+        and gate_up.stride(0) % 2 == 0
+    ):
+        from sglang.kernels.ops.activation.silu_and_mul_clamp_mxfp8_flydsl import (
+            silu_and_mul_clamp_mxfp8_flydsl,
+            silu_and_mul_clamp_mxfp8_supported,
+        )
+
+        if silu_and_mul_clamp_mxfp8_supported(inter_size):
+            return silu_and_mul_clamp_mxfp8_flydsl(gate_up, swiglu_limit)
     fp8_grid = fp8_grid or emit_fp8
     if fp8_grid:
         assert silu_and_mul_clamp_fp8_grid_supported(inter_size, multi_block=True), (
@@ -108,7 +123,9 @@ def silu_and_mul_clamp_triton(
         activation = Fp8GridActivation(out) if fp8_grid else out
     if M == 0:
         return activation
-    block_i = 1024 if inter_size >= 1024 else triton.next_power_of_2(inter_size)
+    # 256-wide one-warp programs: wider ones mask most of the last block (2304 = 2.25 x 1024) and
+    # the [G, 32] reshape of the fp8 epilogue gets slower with every extra warp
+    block_i = min(256, triton.next_power_of_2(inter_size))
     _silu_and_mul_clamp_kernel[(M, triton.cdiv(inter_size, block_i))](
         gate_up,
         out,
@@ -121,6 +138,6 @@ def silu_and_mul_clamp_triton(
         BLOCK_I=block_i,
         FP8_GRID=fp8_grid,
         EMIT_FP8=emit_fp8,
-        num_warps=4,
+        num_warps=1,
     )
     return activation

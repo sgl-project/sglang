@@ -2302,6 +2302,18 @@ class Envs:
     # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
+    # gfx950 shared-expert SwiGLU + MXFP8 quant (the native / aiter down_proj operand) on the
+    # FlyDSL flat-chunk kernel instead of Triton, from MIN_M rows; bit-equal output.
+    SGLANG_HIP_SILU_MXFP8_FLYDSL = EnvBool(False)
+    SGLANG_HIP_SILU_MXFP8_FLYDSL_MIN_M = EnvInt(0)
+    # V4.1 prefill indexer paged top-512, from MIN_ROWS rows of at least MIN_WIDTH scores: aiter's
+    # stable one-block radix top-k + a page map instead of top-k v2 (same index set a row, another
+    # order). Narrower planes stay on v2, which is faster there.
+    SGLANG_HIP_DSV41_RADIX_TOPK = EnvBool(False)
+    SGLANG_HIP_DSV41_RADIX_TOPK_MIN_ROWS = EnvInt(2048)
+    SGLANG_HIP_DSV41_RADIX_TOPK_MIN_WIDTH = EnvInt(40960)
+    # Debug: run both top-k paths on every radix call and log rows whose index sets differ.
+    SGLANG_DEBUG_DSV41_RADIX_TOPK = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
