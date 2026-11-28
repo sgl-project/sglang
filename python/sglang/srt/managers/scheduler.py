@@ -403,11 +403,10 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
-from sglang.srt.sampling.sampler_params import SamplerParamsPool
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -712,7 +711,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
-        self.init_sampler_params_pool()
+        self.init_sampling_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1407,10 +1406,11 @@ class Scheduler(
             device=self.req_to_token_pool.device,
         )
 
-    def init_sampler_params_pool(self) -> None:
-        self.sampler_params_pool = SamplerParamsPool(
+    def init_sampling_params_pool(self) -> None:
+        self.sampling_params_pool = SamplingParamsPool(
             num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
+            penalty_status_pool=self.penalty_status_pool,
         )
 
     def init_running_status(self):
@@ -5103,9 +5103,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5550,17 +5550,11 @@ class Scheduler(
         if self.is_generation:
             # A beam tail's member rows follow the requests' rows; they take no params.
             num_reqs = len(batch.reqs)
-            batch.sampling_info.set_sampler_params(
-                self.sampler_params_pool.gather(
+            batch.sampling_info.set_rows(
+                self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
                 )
-            )
-            batch.sampling_info.step_penalties = StepPenalties.build(
-                batch.reqs, self.penalty_status_pool
-            )
-            batch.sampling_info.watermark = build_watermark_rows(
-                batch.reqs, batch.device
             )
             batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
