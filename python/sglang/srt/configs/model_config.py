@@ -36,6 +36,7 @@ from sglang.srt.configs.ernie55 import (
     to_dspark_draft_config,
     to_nextn_draft_config,
 )
+from sglang.srt.configs.hy_v4_flash import SLIDING_ATTENTION
 from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.unlimited_ocr_v2 import (
@@ -653,6 +654,19 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
         return max(layer_id - offset + 1, 0) % freq != 0
 
     return max(layer_id - 1, 0) % freq != 0
+
+
+def dsa_layer_has_index_k(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer writes and reads the indexer K cache."""
+    if dsa_layer_skips_topk(config, layer_id):
+        return False
+    # Hy4-Flash sliding-window layers select their window without an indexer.
+    if _hf_arch(config) == "HYV4FlashForConditionalGeneration":
+        layer_types = config.layer_types
+        return not (
+            layer_id < len(layer_types) and layer_types[layer_id] == SLIDING_ATTENTION
+        )
+    return True
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
