@@ -30,12 +30,9 @@ def resolve_runtime_policy(
     """Resolve generic and architecture-owned SplitKV launch policy."""
     arch = device_capability[0] * 10 + device_capability[1]
     uses_arch_decode_policy = get_forward_host(arch) is not None
-    no_splitkv = device_capability < (9, 0) or uses_arch_decode_policy
-    num_splits = 1 if deterministic or no_splitkv else 0
-    decode_num_splits = (
-        0 if uses_arch_decode_policy and not deterministic else num_splits
-    )
-    return num_splits, decode_num_splits, uses_arch_decode_policy
+    # One split leaves a short extend over a long cached prefix on q-tiles x kv-heads CTAs.
+    num_splits = 1 if deterministic or device_capability < (9, 0) else 0
+    return num_splits, num_splits, uses_arch_decode_policy
 
 
 @lru_cache(maxsize=None)

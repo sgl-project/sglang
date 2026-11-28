@@ -237,6 +237,9 @@ def flash_attn_with_kvcache(
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
+    if max_seqlen_k is None and page_table is not None:
+        # No request reads past its page table; the pool size would size tiles and splits.
+        max_seqlen_k = page_table.shape[1] * k_cache.shape[1]
 
     forward_arch = get_forward_arch(q.device)
     if (
