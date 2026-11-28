@@ -9,7 +9,7 @@ from sglang.srt.managers.io_struct import (
     SchedulePolicySwitchReqInput,
     SchedulePolicySwitchReqOutput,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -40,6 +40,30 @@ def handle_schedule_policy_switch(
 
     if scheduler._schedule_policy_switch_in_progress:
         return _fail("another schedule policy switch is already in progress")
+
+    parallel = get_parallel()
+    unsupported = [
+        name
+        for name, enabled in (
+            ("pipeline parallelism", parallel.pp_size > 1),
+            ("expert parallelism", parallel.ep_size > 1),
+            ("DP attention", parallel.attn_dp_size > 1),
+            (
+                "attention context parallelism",
+                parallel.attn_cp_size > 1 or parallel.enable_prefill_cp,
+            ),
+            ("decode context parallelism", parallel.dcp_size > 1),
+            ("MoE data parallelism", parallel.moe_dp_size > 1),
+            ("distributed weight data parallelism", parallel.dwdp_size > 1),
+            ("sequence parallelism", parallel.enable_layernorm_sp),
+        )
+        if enabled
+    ]
+    if unsupported:
+        return _fail(
+            "runtime schedule policy switching currently supports only ordinary "
+            "tensor and data parallelism; unsupported: " + ", ".join(unsupported)
+        )
 
     if new_schedule_policy == old_schedule_policy:
         return SchedulePolicySwitchReqOutput(

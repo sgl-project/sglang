@@ -221,6 +221,54 @@ class TestSchedulePolicySwitch(CustomTestCase):
         self.assertIs(self.scheduler.policy, old)
         self.assertTrue(self.scheduler._schedule_policy_switch_in_progress)
 
+    def test_tensor_and_data_parallelism_allow_switching(self):
+        for topology in (
+            {},
+            {"tp_size": 2},
+            {"dp_size": 2},
+            {"tp_size": 2, "dp_size": 2},
+        ):
+            with self.subTest(topology=topology):
+                with get_context().override_server_args(**topology):
+                    self.assertTrue(self.switch("lof").success)
+                    self.assertTrue(self.switch("fcfs").success)
+
+    def test_other_parallel_modes_reject_switching_without_changing_state(self):
+        self.assertTrue(self.switch("lpm").success)
+        old = self.scheduler.policy
+        old._on_bounded_state_change(True)
+        callback = self.scheduler.waiting_queue._on_leave
+        for topology, reason in (
+            ({"pp_size": 2}, "pipeline parallelism"),
+            ({"tp_size": 2, "ep_size": 2}, "expert parallelism"),
+            ({"tp_size": 2, "attn_dp_size": 2}, "DP attention"),
+            ({"tp_size": 2, "attn_cp_size": 2}, "attention context parallelism"),
+            ({"enable_prefill_cp": True}, "attention context parallelism"),
+            ({"tp_size": 2, "dcp_size": 2}, "decode context parallelism"),
+            ({"tp_size": 2, "moe_dp_size": 2}, "MoE data parallelism"),
+            ({"tp_size": 2, "dwdp_size": 2}, "distributed weight data parallelism"),
+            ({"tp_size": 2, "enable_layernorm_sp": True}, "sequence parallelism"),
+        ):
+            for target in ("lof", "lpm"):
+                with self.subTest(topology=topology, target=target):
+                    with get_context().override_server_args(
+                        schedule_policy="lpm", **topology
+                    ):
+                        with patch.object(
+                            self.scheduler, "_create_schedule_policy"
+                        ) as create_policy:
+                            result = self.switch(target)
+                        create_policy.assert_not_called()
+                        self.assertFalse(result.success)
+                        self.assertIn(reason, result.message)
+                        self.assertIs(self.scheduler.policy, old)
+                        self.assertIs(self.scheduler.waiting_queue._on_leave, callback)
+                        self.assertEqual(self.scheduler.schedule_policy, "lpm")
+                        self.assertEqual(get_schedule().schedule_policy, "lpm")
+                        self.assertFalse(
+                            self.scheduler._schedule_policy_switch_in_progress
+                        )
+
     def test_request_schema_accepts_uniboost(self):
         adapter = TypeAdapter(SchedulePolicySwitchReqInput)
         req = adapter.validate_json('{"new_schedule_policy":"uniboost"}')
@@ -265,6 +313,14 @@ class TestSchedulePolicySwitch(CustomTestCase):
             )
             self.assertEqual(response.status_code, 400)
             self.assertEqual(manager.schedule_policy_switch_communicator.await_count, 1)
+            self.assertEqual(self.scheduler.schedule_policy, "lof")
+
+            with get_context().override_server_args(pp_size=2, schedule_policy="lof"):
+                response = client.post(
+                    "/schedule_policy_switch", json={"new_schedule_policy": "fcfs"}
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("pipeline parallelism", response.json()["message"])
             self.assertEqual(self.scheduler.schedule_policy, "lof")
 
             get_context().override(
