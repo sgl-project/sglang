@@ -10,6 +10,20 @@ from .algorithm import force_watermark_tokens, hash_contexts
 if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
+_INT32_MASK = 0xFFFFFFFF
+_INT32_SIGN = 0x80000000
+
+
+def _fold_token_id_to_int32(token_id: int) -> int:
+    """Store arbitrary prompt token ids in the int32 context buffer.
+
+    The watermark hashes only the low 32 bits of each context id
+    (``_murmur3_mix`` masks with ``0xFFFFFFFF``), so multimodal padding ids
+    wider than 32 bits are folded to their low 32 bits with two's-complement
+    sign. Text ids (0..2**31-1) are unchanged.
+    """
+    return ((int(token_id) & _INT32_MASK) ^ _INT32_SIGN) - _INT32_SIGN
+
 
 class WatermarkState:
     def __init__(
@@ -106,7 +120,10 @@ class WatermarkState:
             valid_positions, dtype=torch.int64, device=device
         )
         pool_indices = req_pool_indices[batch_positions].to(torch.int64)
-        tails = [list(prompt_tail_ids[index]) for index in valid_positions]
+        tails = [
+            [_fold_token_id_to_int32(token_id) for token_id in prompt_tail_ids[index]]
+            for index in valid_positions
+        ]
         lengths = torch.tensor(
             [len(token_ids) for token_ids in tails], dtype=torch.int32, device=device
         )
