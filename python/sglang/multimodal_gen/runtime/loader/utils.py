@@ -551,10 +551,15 @@ def checkpoint_component_sizes(
         if subfolder:
             root = os.path.join(root, subfolder)
         with open(os.path.join(root, "model_index.json")) as f:
+            # a component is a [library, class] pair; other lists, such as
+            # Qwen-Image-2.1-Turbo's sample_sigmas, are pipeline settings
             components = [
                 name
                 for name, spec in json.load(f).items()
-                if isinstance(spec, list) and spec[0] is not None
+                if isinstance(spec, list)
+                and len(spec) >= 2
+                and isinstance(spec[0], str)
+                and isinstance(spec[1], str)
             ]
         sizes = {}
         for name in components:
