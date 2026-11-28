@@ -11,9 +11,23 @@ import torch.nn.functional as F
 
 
 def validate_ubtree_lm_head(lm_head) -> torch.Tensor:
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+        VocabParallelEmbedding,
+    )
     from sglang.srt.speculative.dflash_utils import is_dense_head_weight
 
-    weight = getattr(lm_head, "weight", None)
+    if isinstance(lm_head, VocabParallelEmbedding):
+        if not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+            raise ValueError(
+                "UBTREE requires a dense FP16/BF16/FP32 target lm_head. "
+                "Quantized target lm_head is unsupported."
+            )
+        weight = lm_head.weight
+    elif isinstance(lm_head, torch.nn.Linear):
+        weight = lm_head.weight
+    else:
+        weight = None
     if weight is None:
         raise RuntimeError("UBTREE requires a target lm_head with a weight tensor")
     if not is_dense_head_weight(weight):

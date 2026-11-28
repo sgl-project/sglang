@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from sglang.srt.speculative.ubtree_components.config import (
     UBTreeConfig,
     parse_ubtree_config,
@@ -249,14 +252,25 @@ class UBTreeSelector(nn.Module):
 
     def bind_target_embedding(self, embedding_module: nn.Module, *, device) -> None:
         """Build the serving cache and declare its online-update constraint."""
-        weight = getattr(embedding_module, "weight", None)
+        vocab_parallel = isinstance(embedding_module, VocabParallelEmbedding)
+        if vocab_parallel:
+            if not isinstance(
+                embedding_module.quant_method, UnquantizedEmbeddingMethod
+            ):
+                raise ValueError(
+                    "UBTREE requires dense FP16/BF16/FP32 target embeddings"
+                )
+            weight = embedding_module.weight
+        elif isinstance(embedding_module, nn.Embedding):
+            weight = embedding_module.weight
+        else:
+            weight = None
         if weight is None:
             raise RuntimeError("UBTREE requires target input embeddings with weights")
         from sglang.srt.speculative.dflash_utils import is_dense_head_weight
 
         if not is_dense_head_weight(weight):
             raise ValueError("UBTREE requires dense FP16/BF16/FP32 target embeddings")
-        vocab_parallel = isinstance(embedding_module, VocabParallelEmbedding)
         if (not vocab_parallel or embedding_module.tp_size == 1) and int(
             weight.shape[0]
         ) >= self.vocab_size:

@@ -247,12 +247,11 @@ class TestUBTreeComponents(CustomTestCase):
                 remote = remote_values if output.dtype.is_floating_point else remote_ids
                 output.copy_(torch.cat([remote.reshape(-1), local]))
 
-        head = SimpleNamespace(
-            weight=local_weight,
-            shard_indices=SimpleNamespace(
-                num_org_elements=4,
-                org_vocab_start_index=4,
-            ),
+        head = torch.nn.Linear(2, 4, bias=False)
+        head.weight = torch.nn.Parameter(local_weight, requires_grad=False)
+        head.shard_indices = SimpleNamespace(
+            num_org_elements=4,
+            org_vocab_start_index=4,
         )
         values, ids = vocab_parallel_topk(
             hidden,
@@ -640,11 +639,15 @@ class TestUBTreeLoading(CustomTestCase):
             torch.testing.assert_close(dict(model.named_parameters())[name], value * 2)
 
     def test_quantized_head_is_rejected_before_matmul(self):
+        quantized_head = torch.nn.Linear(8, 17, bias=False)
+        quantized_head.weight = torch.nn.Parameter(
+            torch.ones((17, 8), dtype=torch.int8), requires_grad=False
+        )
         with patch("torch.nn.functional.linear") as linear:
             with self.assertRaisesRegex(ValueError, "dense FP16/BF16/FP32"):
                 vocab_parallel_topk(
                     torch.ones(1, 8),
-                    SimpleNamespace(weight=torch.ones((17, 8)).to(torch.int8)),
+                    quantized_head,
                     k=3,
                     vocab_size=17,
                 )

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -59,17 +58,55 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-@dataclass
 class _UBTreeTopkCaptureOutput(TopkCaptureOutput):
-    valid_len: torch.Tensor
+    def __init__(
+        self,
+        out_cache_loc: torch.Tensor,
+        topk: torch.Tensor,
+        host_cache,
+        valid_len: torch.Tensor,
+    ) -> None:
+        super().__init__(
+            out_cache_loc=out_cache_loc,
+            topk=topk,
+            host_cache=host_cache,
+        )
+        self.valid_len = valid_len
 
     def map_device_tensors(self, fn):
         super().map_device_tensors(fn)
         self.valid_len = fn(self.valid_len)
 
     def finalize(self):
+        if self.host_cache is None:
+            return
         n = int(self.valid_len.item())
         self.host_cache.buffer[self.out_cache_loc[:n]] = self.topk[:n]
+
+
+def _supports_prefix_valid_kv(draft_pool, draft_layers) -> bool:
+    if draft_pool is None:
+        return False
+    from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKVPoolMXFP8,
+        PageMajorMHATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+
+    unsupported = (
+        PageMajorMHATokenToKVPool,
+        MHATokenToKVPoolMXFP8,
+        PageInterleaveKVPoolMixin,
+    )
+    views = [
+        draft_pool.layer_router.layer(layer.self_attn.attn.layer_id).view
+        for layer in draft_layers
+    ]
+    return bool(views) and all(
+        isinstance(view, MHAKVView) and not isinstance(view, unsupported)
+        for view in views
+    )
 
 
 class UBTreeWorkerV2(DFlashWorkerV2):
@@ -87,12 +124,9 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 "UBTREE target tree verification requires speculative_eagle_topk "
                 "above 1, or the FA3 and KDA target backends verify a chain"
             )
-        # The target runner needs ``topk > 1`` to select SGLang's parent-aware
-        # tree-verification attention path.  The DFlash draft is a linear
-        # 16-slot block, however, and its ``custom_mask`` is intentionally
-        # ``None``. Temporarily expose the linear geometry through SGLang's
-        # published spec config while DFlashWorkerV2 constructs its draft
-        # runner; the scoped override restores the target tree geometry.
+        # Target verification needs topk > 1 for parent-aware tree attention,
+        # while the linear DFlash draft block keeps custom_mask as None.
+        # Override spec config during draft construction, then restore tree width.
         draft_block_size = get_spec().speculative_dflash_block_size
         if draft_block_size is None:
             raise ValueError("UBTREE requires a resolved DFlash block size")
@@ -240,7 +274,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             can_fold_draft_kv = (
                 self._use_fused_kv_materialize
                 and self._fused_kv_helper is not None
-                and hasattr(draft_pool, "set_kv_buffer_prefix_valid")
+                and _supports_prefix_valid_kv(draft_pool, self.draft_model.layers)
             )
             mamba_pool = target_kvcache.layer_router.part_view(STATE_PART)
             if (
@@ -283,8 +317,6 @@ class UBTreeWorkerV2(DFlashWorkerV2):
     def _draft_tree(
         self, batch, draft_input: DFlashDraftInputV2
     ) -> tuple[UBTreeBatch, torch.Tensor, torch.Tensor]:
-        """Run the DFlash block and turn its parallel hidden rows into trees."""
-
         bs = len(batch.seq_lens)
         block_size = int(self.block_size)
         device = self.device

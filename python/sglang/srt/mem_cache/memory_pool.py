@@ -591,7 +591,6 @@ class MambaPool:
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
-    @dataclass(frozen=True, kw_only=True)
     class UBTreeSpeculativeState(SpeculativeState):
         # UBTree KDA factorized verify stores raw per-node recurrence inputs in
         # request-local scratch rows until sampling selects the committed path.
@@ -599,6 +598,79 @@ class MambaPool:
         tree_rawk: torch.Tensor
         tree_g: torch.Tensor
         tree_beta: torch.Tensor
+
+        def __init__(
+            self,
+            *,
+            tree_rawv: torch.Tensor,
+            tree_rawk: torch.Tensor,
+            tree_g: torch.Tensor,
+            tree_beta: torch.Tensor,
+            **kwargs,
+        ) -> None:
+            super().__init__(**kwargs)
+            object.__setattr__(self, "tree_rawv", tree_rawv)
+            object.__setattr__(self, "tree_rawk", tree_rawk)
+            object.__setattr__(self, "tree_g", tree_g)
+            object.__setattr__(self, "tree_beta", tree_beta)
+
+        def at_layer_idx(self, layer: int):
+            return type(self)(
+                conv=[c[layer] for c in self.conv],
+                temporal=self.temporal[layer],
+                replayssm_d=(
+                    None if self.replayssm_d is None else self.replayssm_d[layer]
+                ),
+                replayssm_k=(
+                    None if self.replayssm_k is None else self.replayssm_k[layer]
+                ),
+                replayssm_g=(
+                    None if self.replayssm_g is None else self.replayssm_g[layer]
+                ),
+                replayssm_rawv=(
+                    None
+                    if self.replayssm_rawv is None
+                    else self.replayssm_rawv[layer]
+                ),
+                replayssm_rawk=(
+                    None
+                    if self.replayssm_rawk is None
+                    else self.replayssm_rawk[layer]
+                ),
+                replayssm_beta=(
+                    None
+                    if self.replayssm_beta is None
+                    else self.replayssm_beta[layer]
+                ),
+                intermediate_ssm=(
+                    None
+                    if self.intermediate_ssm is None
+                    else self.intermediate_ssm[layer]
+                ),
+                intermediate_conv_window=[
+                    c[layer] for c in self.intermediate_conv_window
+                ],
+                tree_rawv=self.tree_rawv[layer],
+                tree_rawk=self.tree_rawk[layer],
+                tree_g=self.tree_g[layer],
+                tree_beta=self.tree_beta[layer],
+            )
+
+        def __setattr__(self, name: str, value) -> None:
+            raise dataclasses.FrozenInstanceError(
+                f"cannot assign to field {name!r}"
+            )
+
+        def __delattr__(self, name: str) -> None:
+            raise dataclasses.FrozenInstanceError(
+                f"cannot delete field {name!r}"
+            )
+
+        def mem_usage_bytes(self):
+            return super().mem_usage_bytes() + sum(
+                get_tensor_size_bytes(t)
+                for t in (self.tree_rawv, self.tree_rawk, self.tree_g, self.tree_beta)
+            )
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int

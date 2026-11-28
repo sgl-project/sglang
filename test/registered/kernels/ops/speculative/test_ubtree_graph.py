@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -315,9 +316,11 @@ def _make_selector_graph_components(device):
 
 def _assert_tree_batches_equal(actual, expected):
     assert actual.__struct_fields__ == expected.__struct_fields__
-    for name in actual.__struct_fields__:
-        actual_value = getattr(actual, name)
-        expected_value = getattr(expected, name)
+    for name, actual_value, expected_value in zip(
+        actual.__struct_fields__,
+        msgspec.structs.astuple(actual),
+        msgspec.structs.astuple(expected),
+    ):
         if expected_value is None or actual_value is None:
             assert actual_value is expected_value, name
         elif isinstance(expected_value, torch.Tensor):

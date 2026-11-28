@@ -104,8 +104,6 @@ def _build_tree_metadata_kernel(
 def _tree_metadata(
     parent_ids: torch.Tensor, *, max_depth: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build visibility and linked-tree metadata in one CUDA kernel."""
-
     batch, nodes = parent_ids.shape
     visibility = torch.empty(
         (batch, nodes, nodes), dtype=torch.bool, device=parent_ids.device
@@ -344,8 +342,6 @@ def _build_ubtree_batch_fused(
     supertree_width: int,
     depth_bonus: float = 0.0,
 ) -> UBTreeBatch:
-    """CUDA implementation fusing score/gather work around exact torch.topk."""
-
     batch, depth_count, candidate_k = candidate_ids.shape
     width = int(supertree_width)
     max_nodes = 1 + depth_count * width

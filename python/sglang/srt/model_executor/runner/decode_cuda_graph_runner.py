@@ -302,6 +302,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _metadata_prep_fork: Optional[tuple] = None
     # Set in __init__: a speculative verify's checkpoint ids for its replay prep.
     _verify_checkpoint_ids: Optional[torch.Tensor] = None
+    _verify_checkpoint_ids_dirty: bool = False
+    _reset_verify_checkpoint_ids_on_absent: bool = False
     _metadata_prep_fork_resolved = False
     _early_verify_metadata = None
     _skips_prefilled_inputs = False
@@ -1959,8 +1961,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ids = forward_batch.mamba_track_indices
         if ids is None:
             if (
-                getattr(self, "_reset_verify_checkpoint_ids_on_absent", False)
-                and getattr(self, "_verify_checkpoint_ids_dirty", False)
+                self._reset_verify_checkpoint_ids_on_absent
+                and self._verify_checkpoint_ids_dirty
             ):
                 self._verify_checkpoint_ids.fill_(-1)
                 self._verify_checkpoint_ids_dirty = False

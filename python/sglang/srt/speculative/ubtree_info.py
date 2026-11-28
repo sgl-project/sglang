@@ -6,24 +6,36 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
 from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
-@dataclass
 class UBTreeVerifyInput(EagleVerifyInput):
     # Direct local parent index for every verify node. UBTree already owns this
     # topology, so hybrid recurrent kernels must not reconstruct it per layer.
-    retrieve_parent_token: torch.Tensor | None = None
+    retrieve_parent_token: torch.Tensor | None
     # Per-node depth (root=0). The KDA verify backend copies this into a
     # graph-stable buffer and uses it to launch one parallel wave per depth.
-    tree_depths: torch.Tensor | None = None
-    logical_max_depth: int = 1
-    tree_mask_mode: TreeMaskMode = TreeMaskMode.QLEN_ONLY
+    tree_depths: torch.Tensor | None
+    logical_max_depth: int
+    tree_mask_mode: TreeMaskMode
+
+    def __init__(
+        self,
+        *args,
+        retrieve_parent_token: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        logical_max_depth: int = 1,
+        tree_mask_mode: TreeMaskMode = TreeMaskMode.QLEN_ONLY,
+        **kwargs,
+    ) -> None:
+        self.retrieve_parent_token = retrieve_parent_token
+        self.tree_depths = tree_depths
+        self.logical_max_depth = logical_max_depth
+        self.tree_mask_mode = tree_mask_mode
+        super().__init__(*args, **kwargs)
 
     @property
     def uses_direct_parent(self) -> bool:

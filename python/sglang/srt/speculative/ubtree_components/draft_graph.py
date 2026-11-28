@@ -130,11 +130,9 @@ class UBTreeDraftSegmentGraphRunner:
             tail_output=None,
         )
         current_stream = torch.cuda.current_stream(self.device)
-        # Use SGLang's distributed graph-capture context instead of a raw CUDA
-        # stream.  Besides synchronizing the shared capture stream, this enables
-        # graph-safe TP communicators for the vocab-parallel embedding and the
-        # proposal Top-K all-gathers.  All TP ranks enter this path in the same
-        # order for an exact decode batch size.
+        # Enter SGLang's distributed graph_capture so TP communicators for the
+        # vocab-parallel embedding and proposal Top-K all-gathers are graph-safe.
+        # Every TP rank enters in the same order per exact decode batch size.
         with (
             graph_capture(
                 stream=get_or_create_global_graph_capture_stream()
@@ -193,7 +191,10 @@ class UBTreeDraftSegmentGraphRunner:
             raise ValueError(f"input_ids must have shape {expected_shape}")
         if tuple(positions.shape) != expected_shape:
             raise ValueError(f"positions must have shape {expected_shape}")
-        if tuple(forward_batch.out_cache_loc.shape) != expected_shape:
+        if (
+            forward_batch.out_cache_loc is None
+            or tuple(forward_batch.out_cache_loc.shape) != expected_shape
+        ):
             raise ValueError(f"out_cache_loc must have shape {expected_shape}")
         return self._replay_full(
             input_ids=input_ids, positions=positions, forward_batch=forward_batch

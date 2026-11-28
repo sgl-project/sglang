@@ -34,12 +34,6 @@ def _sample_target_tokens(
     seed: torch.Tensor,
     offset: torch.Tensor,
 ) -> torch.Tensor:
-    """Use the ordinary FlashInfer AR sampler for every verification node.
-
-    Keep the full vocabulary, including probability ties at the top-k cutoff.
-    Both branches keep the joint top-k/top-p support. The min-p branch, like
-    AR, renormalizes by top-p before top-k and then applies the min-p cut.
-    """
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
@@ -103,8 +97,10 @@ class UBTreeSamplingGraphRunner:
     def _stage_inputs(destination, source) -> None:
         # Always refresh the small parameter tensors. Their objects can be
         # replaced or updated in place between requests and overlap batches.
-        for name in ("temperatures", "top_ks", "top_ps", "min_ps"):
-            getattr(destination, name).copy_(getattr(source, name))
+        destination.temperatures.copy_(source.temperatures)
+        destination.top_ks.copy_(source.top_ks)
+        destination.top_ps.copy_(source.top_ps)
+        destination.min_ps.copy_(source.min_ps)
 
     def _run_tail(
         self, *, logits, hidden, sampling_info, epilogue, metadata

@@ -36,16 +36,12 @@ def _tensor_bytes(tensor):
 
 
 def _scratch_bytes(state):
-    return sum(_tensor_bytes(t) for t in state.intermediate_conv_window) + sum(
-        _tensor_bytes(getattr(state, name, None))
-        for name in (
-            "intermediate_ssm",
-            "tree_rawv",
-            "tree_rawk",
-            "tree_g",
-            "tree_beta",
+    tensors = [*state.intermediate_conv_window, state.intermediate_ssm]
+    if isinstance(state, MambaPool.UBTreeSpeculativeState):
+        tensors.extend(
+            (state.tree_rawv, state.tree_rawk, state.tree_g, state.tree_beta)
         )
-    )
+    return sum(_tensor_bytes(t) for t in tensors)
 
 
 class TestUBTreeState(CustomTestCase):
@@ -231,9 +227,9 @@ class TestUBTreeState(CustomTestCase):
                 ),
             ):
                 info = TpModelWorker.get_worker_info(worker)
-                expected_max_req = 512 - 1 - expected_reach
+                expected_max_req = 512 - expected_reach
                 self.assertEqual(info[4], expected_max_req)
-                self.assertEqual(info[5], expected_max_req - 5)
+                self.assertEqual(info[5], expected_max_req - 6)
 
         worker.model_runner.effective_logical_max_total_num_tokens = 106
         worker.model_runner.logical_max_total_num_tokens = 106
@@ -246,7 +242,7 @@ class TestUBTreeState(CustomTestCase):
             page_size=1,
         ):
             info = TpModelWorker.get_worker_info(worker)
-            self.assertEqual((info[4], info[5]), (7, 2))
+            self.assertEqual((info[4], info[5]), (8, 2))
             worker.model_runner.effective_logical_max_total_num_tokens = 105
             worker.model_runner.logical_max_total_num_tokens = 105
             worker.model_runner.token_to_kv_pool.size = 105
