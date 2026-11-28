@@ -95,7 +95,7 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
-# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants.
+# The early target verify metadata serves these target verify variants.
 DSV41_EARLY_VERIFY_VARIANTS = frozenset(
     {DSV41_CANDIDATE_UNFILTERED, DSV41_CANDIDATE_FILTERED}
 )

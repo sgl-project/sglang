@@ -1,4 +1,4 @@
-"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft KV store writes what the static
+"""The deferred draft KV store writes what the static
 verify would have, once, and only the rows of the requests the draft carries."""
 
 import os

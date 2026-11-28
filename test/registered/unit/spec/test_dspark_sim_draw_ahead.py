@@ -1,7 +1,7 @@
-"""SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD: the simulated acceptance draw and the sim
-bonus seed move before the draft launch. They read only the server-seeded generator,
-the batch size and the request temperatures, so the ahead order writes exactly what
-the after-draft order wrote; with real acceptance the switch is inert."""
+"""Under simulated acceptance, the acceptance draw and the sim bonus seed run before the
+draft launch. They read only the server-seeded generator, the batch size and the
+request temperatures, so the ahead order writes exactly what the after-draft order
+wrote."""
 
 import sys
 from types import SimpleNamespace
@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components import dspark_worker_v2 as worker_mod
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
@@ -86,16 +85,6 @@ def test_ahead_matches_after_draft():
     assert ahead == after
     assert len({s[0] for s in after}) > 1  # the draw really varies across steps
     assert w.num_sim_draws_ahead == steps
-
-
-def test_inert_under_real_acceptance():
-    with envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.override(True):
-        assert not worker_mod.sim_draw_ahead_enabled(None)
-        assert worker_mod.sim_draw_ahead_enabled(torch.zeros((1,), dtype=torch.int64))
-    with envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.override(False):
-        assert not worker_mod.sim_draw_ahead_enabled(
-            torch.zeros((1,), dtype=torch.int64)
-        )
 
 
 if __name__ == "__main__":

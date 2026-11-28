@@ -153,15 +153,6 @@ def _configure_target_hidden_projection(
     )
 
 
-def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> bool:
-    """SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD, only under simulated acceptance: with
-    real acceptance there is no draw, so the step order stays as it was."""
-    return (
-        envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.get()
-        and simulated_correct_len is not None
-    )
-
-
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -169,7 +160,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
-    _prepare_inputs_once = False
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
@@ -350,10 +340,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
-        # Verify-window positions, cache locs and the draft anchor column in one launch.
-        self._prepare_inputs_once = (
-            envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
-        )
         self.num_folded_verify_ids_steps = 0
         self.num_relayed_in_graph_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -421,7 +407,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # The simulated acceptance draw (and sim bonus seed) before the draft launch,
         # where the host waits on the previous verify anyway; off with real acceptance.
-        self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
+        self._sim_draw_ahead = self._simulated_correct_len is not None
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         markov_head = self.draft_model.markov_head
@@ -464,12 +450,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
-        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the static verify's inputs are final
-        # after the head; the target runner stages their metadata beside the draft.
+        # The static verify's inputs are final after the head; the target runner
+        # stages their metadata beside the draft.
         self._verify_inputs_ready: Optional[torch.cuda.Event] = (
             torch.cuda.Event()
-            if envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY.get()
-            and self._verify_planner.mode_value == "static"
+            if self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
             and torch.device(self.device).type == "cuda"
             else None
@@ -514,14 +499,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
-                fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
-                accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
-                accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
+                fused_accept_tail=True,
                 deferred_draft_kv=self._deferred_draft_kv,
-                post_fold=(
-                    static_epilogue_supported
-                    and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
-                ),
+                post_fold=static_epilogue_supported,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -530,14 +510,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                     kv_injector=self._kv_injector,
-                    resolve_engram_hasher=(
-                        (
-                            lambda: (
-                                self.model_runner.ngram_embedding_manager.engram_hasher
-                            )
-                        )
-                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
-                        else None
+                    resolve_engram_hasher=lambda: (
+                        self.model_runner.ngram_embedding_manager.engram_hasher
                     ),
                 ),
             )
@@ -1084,10 +1058,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        anchor_ids = (
-            self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-            if self._prepare_inputs_once
-            else None
+        # Verify-window positions, cache locs and the draft anchor column in one launch.
+        anchor_ids = self._proposer.draft_block_ids_view(
+            bs=bs, device=prefix_lens.device
         )
         window_seq_lens_cpu = (
             batch.seq_lens_cpu
@@ -1102,7 +1075,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
             seq_lens_cpu=window_seq_lens_cpu,
-            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
+            bonus=draft_input.bonus_tokens.view(-1),
             anchor_ids=anchor_ids,
         )
         if self._verify_inputs_ready is not None:
@@ -1142,7 +1115,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
-                anchor_prepared=anchor_ids is not None,
             )
         if self._verify_inputs_ready is not None:
             self._stage_target_verify_metadata(
@@ -1450,7 +1422,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
         """The FutureMap relay this step's static graph already scattered into
-        (SGLANG_OPT_DSV41_DSPARK_POST_FOLD), or None for the host scatter."""
+        (the static epilogue's post fold), or None for the host scatter."""
         epilogue = self._verify_executor.verify_epilogue
         if epilogue is None or run_compact or not folded_accept:
             return None

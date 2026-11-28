@@ -1,5 +1,4 @@
-"""Target-verify attention metadata staged during the draft forward
-(SGLANG_OPT_DSV41_TARGET_METADATA_EARLY).
+"""Target-verify attention metadata staged during the draft forward.
 
 The verify inputs the metadata reads (positions, write locations, seq lens and
 req pool indices) are final once the decode head has run. ``stage``, which the host
