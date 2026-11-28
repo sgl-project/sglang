@@ -55,9 +55,139 @@ _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGE
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
 # gfx1250 has no tuned hipBLASLt bf16 kernels. For FLUX.2 shapes FlyDSL's a16w16
-# runs 930-960 TFLOPS vs 650-700 for Inductor's templates and ~880 for tgemm.
+# runs 930-960 TFLOPS vs 650-700 for Inductor's templates and ~880 for tgemm, and
+# the TDM kernel another 9-15% on top of that once tuned, loaded or idle. Both are
+# used where available: the TDM kernel takes whole K tiles only and 16-byte-aligned
+# operands, and the a16w16 one serves everything it turns down.
+_TDM_BLOCK_K = 128
+# The TDM kernel addresses A, B and C with 32-bit signed byte offsets. Shapes past
+# that (Wan 2.2's large-M QKV projection is one) must stay on the a16w16 kernel;
+# aiter raises rather than reading out of range, so the check has to happen here.
+_TDM_MAX_LEADING_OFFSET = (2**32 - 1) // 2
+_USE_FLYDSL_TDM_GEMM = False
 if USE_AITER_GFX1250:
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as _flydsl_gemm
+
+    try:
+        from aiter.ops.flydsl.gemm_a16w16_tdm import gemm_a16w16_tdm as _flydsl_tdm_gemm
+    except ImportError:
+        _flydsl_tdm_gemm = None
+    _USE_FLYDSL_TDM_GEMM = _flydsl_tdm_gemm is not None
+
+    def _flydsl_tile_m(m: int, n: int, device: torch.device) -> int:
+        num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+        # Measured on FLUX.2 shapes; 128-row tiles only when 256x256 underfills the CUs.
+        return 256 if -(-m // 256) * -(-n // 256) >= num_cus else 128
+
+    def _flydsl_default_gemm_2d(
+        x_2d: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        return _flydsl_gemm(
+            x_2d,
+            weight,
+            bias=bias,
+            dtype=x_2d.dtype,
+            tile_m=_flydsl_tile_m(x_2d.shape[0], weight.shape[0], x_2d.device),
+            tile_n=256,
+            tile_k=64,
+            m_warp=2,
+            n_warp=4,
+            num_buffers=4,
+            variant="compute_bound",
+        )
+
+    # A partial last M tile costs a whole tile: FLUX.2's M=4112 and 3600 both end
+    # on 16 rows of a 256-row tile (~6% of the GEMM). Up to this many leftover rows
+    # go to a 16-row-tile launch instead. Measured at 16 only.
+    _TDM_TAIL_MAX_ROWS = 16
+    # The tail re-reads all of B; with few N tiles it is latency bound, so split K.
+    _TDM_TAIL_SPLIT_K = 4
+    _TDM_TAIL_SPLIT_K_MAX_N_TILES = 64
+
+    def _flydsl_tdm_tail_gemm(
+        x_2d: torch.Tensor,
+        weight_t: torch.Tensor,
+        bias: torch.Tensor | None,
+        out: torch.Tensor,
+    ) -> None:
+        n, k = weight_t.shape[1], weight_t.shape[0]
+        split_k = (
+            _TDM_TAIL_SPLIT_K
+            if -(-n // 256) < _TDM_TAIL_SPLIT_K_MAX_N_TILES
+            and k % (_TDM_TAIL_SPLIT_K * _TDM_BLOCK_K) == 0
+            else 1
+        )
+        _flydsl_tdm_gemm(
+            x_2d,
+            weight_t,
+            out=out,
+            bias=bias,
+            block_m=16,
+            block_n=256,
+            block_k=_TDM_BLOCK_K,
+            m_waves=1,
+            n_waves=4 if split_k == 1 else 2,
+            group_m=1,
+            split_k=split_k,
+        )
+
+    def _flydsl_tdm_gemm_2d(
+        x_2d: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        m, n = x_2d.shape[0], weight.shape[0]
+        block_m = _flydsl_tile_m(m, n, x_2d.device)
+        tail = m % block_m
+        if not (m > block_m and 0 < tail <= _TDM_TAIL_MAX_ROWS):
+            tail = 0
+        # B is the logical [K, N] view of weight.
+        weight_t = weight.t()
+        out = torch.empty((m, n), device=x_2d.device, dtype=x_2d.dtype)
+        # 2x2 waves + interleave is the TDM config with the best FLOPs per joule:
+        # measured with both halves of a package at the shared 1600 W cap, where
+        # 2x4 waves is 4% slower.
+        _flydsl_tdm_gemm(
+            x_2d[: m - tail],
+            weight_t,
+            out=out[: m - tail],
+            bias=bias,
+            block_m=block_m,
+            block_n=256,
+            block_k=_TDM_BLOCK_K,
+            m_waves=2,
+            n_waves=2,
+            group_m=8,
+            interleave=True,
+        )
+        if tail:
+            _flydsl_tdm_tail_gemm(x_2d[m - tail :], weight_t, bias, out[m - tail :])
+        return out
+
+    def _tdm_offsets_fit(x_2d: torch.Tensor, weight: torch.Tensor) -> bool:
+        """Whether A, B and the widest C stay inside the kernel's 32-bit offsets."""
+        n = weight.shape[0]
+        return (
+            max(
+                x_2d.shape[0] * x_2d.stride(0),
+                n * weight.stride(0),
+                x_2d.shape[0] * n,
+            )
+            <= _TDM_MAX_LEADING_OFFSET
+        )
+
+    def _tdm_gemm_supported(
+        x_2d: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> bool:
+        n, k = weight.shape
+        operands = (x_2d, weight) if bias is None else (x_2d, weight, bias)
+        return (
+            k % _TDM_BLOCK_K == 0
+            # 8 elements = 16 bytes: the leading strides and the output row pitch.
+            and n % 8 == 0
+            and x_2d.stride(0) % 8 == 0
+            and weight.stride(0) % 8 == 0
+            and _tdm_offsets_fit(x_2d, weight)
+            and all(t.data_ptr() % 16 == 0 for t in operands)
+        )
 
     @register_custom_op(
         op_name="flydsl_gfx1250_linear",
@@ -69,24 +199,11 @@ if USE_AITER_GFX1250:
         x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         x_2d = x.reshape(-1, x.shape[-1])
-        m, n = x_2d.shape[0], weight.shape[0]
-        num_cus = torch.cuda.get_device_properties(x.device).multi_processor_count
-        # Measured on FLUX.2 shapes; 128-row tiles only when 256x256 underfills the CUs.
-        tile_m = 256 if -(-m // 256) * -(-n // 256) >= num_cus else 128
-        out = _flydsl_gemm(
-            x_2d,
-            weight,
-            bias=bias,
-            dtype=x.dtype,
-            tile_m=tile_m,
-            tile_n=256,
-            tile_k=64,
-            m_warp=2,
-            n_warp=4,
-            num_buffers=4,
-            variant="compute_bound",
-        )
-        return out.view(*x.shape[:-1], n)
+        if _USE_FLYDSL_TDM_GEMM and _tdm_gemm_supported(x_2d, weight, bias):
+            out = _flydsl_tdm_gemm_2d(x_2d, weight, bias)
+        else:
+            out = _flydsl_default_gemm_2d(x_2d, weight, bias)
+        return out.view(*x.shape[:-1], weight.shape[0])
 
 
 # Only M >= 256 was measured; below it torch.compile fuses the small GEMMs into
