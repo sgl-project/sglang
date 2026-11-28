@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     normalize_serialized_named_tensor_payloads,
     numa_utils,
     set_ulimit,
+    write_stderr_signal_safe,
 )
 from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -2029,7 +2030,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             # Note: This sigquit handler is used in the launch phase, and may be replaced by
             # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
             def launch_phase_sigquit_handler(signum, frame):
-                logger.error(
+                write_stderr_signal_safe(
                     "Received sigquit from a child process. It usually means the child failed."
                 )
                 kill_process_tree(os.getpid())

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "kill_process_tree",
+    "write_stderr_signal_safe",
     "set_ulimit",
     "delete_directory",
     "set_gpu_proc_affinity",
@@ -99,6 +100,20 @@ def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
         time.sleep(0.1)
 
 
+def write_stderr_signal_safe(msg: str) -> None:
+    """Write one line to fd 2 without going through ``sys.stderr``.
+
+    A signal handler runs in the main thread between bytecodes, possibly while
+    that thread is inside ``sys.stderr``'s buffered write. Logging from the
+    handler then raises ``RuntimeError: reentrant call inside
+    <_io.BufferedWriter name='<stderr>'>`` and replaces the error being reported.
+    """
+    try:
+        os.write(2, f"{msg}\n".encode(errors="replace"))
+    except OSError:
+        pass
+
+
 def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
@@ -115,10 +130,14 @@ def kill_process_tree(
     calls `sys.exit(0)` and cannot wait for itself -- use
     `include_parent=False` if child reap must finish first.
     """
-    logger.info(
-        f"kill_process_tree called: parent_pid={parent_pid}, "
-        f"include_parent={include_parent}, pid={os.getpid()}"
-    )
+    try:
+        logger.info(
+            f"kill_process_tree called: parent_pid={parent_pid}, "
+            f"include_parent={include_parent}, pid={os.getpid()}"
+        )
+    except RuntimeError:
+        # Called from a signal handler while stderr was mid-write; still kill.
+        pass
 
     if parent_pid is None:
         parent_pid = os.getpid()

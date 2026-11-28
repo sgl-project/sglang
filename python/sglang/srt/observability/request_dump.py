@@ -26,6 +26,7 @@ from sglang.srt.sampling.watermarking.redaction import (
     redact_watermark_secrets,
 )
 from sglang.srt.server_args import redact_secret_cli_args, redact_server_args_secrets
+from sglang.srt.utils.process import write_stderr_signal_safe
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ class CrashDumpGrace:
         if self._waited.is_set():
             self.previous(signum, frame)
             return
-        logger.error(
+        write_stderr_signal_safe(
             "Received sigquit from a child process. It usually means the child failed."
         )
         if self._started.is_set():
