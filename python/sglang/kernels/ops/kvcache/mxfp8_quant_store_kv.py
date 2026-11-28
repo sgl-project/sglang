@@ -4,6 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
+
+def _use_sm12x_pdl() -> bool:
+    arch = current_arch()
+    return arch.supports_pdl and arch.is_sm(12)
+
 
 @triton.jit
 def _mxfp8_quant_store_qkv_kernel(
@@ -30,7 +37,11 @@ def _mxfp8_quant_store_qkv_kernel(
     NKV: tl.constexpr,
     D: tl.constexpr,
     PAGE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     t = tl.program_id(0)
     r = tl.program_id(1)
     myloc = tl.load(loc_ptr + t).to(tl.int64)
@@ -104,6 +115,7 @@ def quant_store_kv_mxfp8(
     assert k_cache.stride(2) == v_cache.stride(2) == 1
     if T == 0:
         return
+    pdl = _use_sm12x_pdl()
     _mxfp8_quant_store_qkv_kernel[(T, 2 * NKV)](
         k,  # unused q_ptr (same elem dtype)
         k,
@@ -128,4 +140,6 @@ def quant_store_kv_mxfp8(
         NKV=NKV,
         D=D,
         PAGE=page_size,
+        USE_PDL=pdl,
+        **({"launch_pdl": True} if pdl else {}),
     )
