@@ -152,11 +152,12 @@ def test_folds_engram_commit_only_under_capture(monkeypatch, capturing):
         positions=torch.zeros(bs * stride, dtype=torch.int64),
     )
     out = SimpleNamespace(
-        next_token_logits=torch.randn(bs * stride, vocab), hidden_states=None
+        next_token_logits=torch.randn(bs * stride, vocab),
+        hidden_states=torch.zeros(bs * stride, 8),
     )
     epi._static_epilogue(out, fb)
     assert epi.folds_engram_commit == capturing
-    assert (bs in epi.static_io) == capturing
+    assert ((bs, out.hidden_states.data_ptr()) in epi.static_io) == capturing
 
 
 if __name__ == "__main__":
