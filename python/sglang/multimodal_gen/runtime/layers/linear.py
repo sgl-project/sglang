@@ -358,7 +358,39 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
             return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
+        if getattr(layer, "aiter_bpreshuffle_asm", False):
+            return apply_aiter_bpreshuffle_linear(layer, x, bias)
         return apply_unquantized_linear(x, layer.weight, bias)
+
+
+_AITER_BPRESHUFFLE_KERNEL = "_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE"
+
+
+def apply_aiter_bpreshuffle_linear(
+    layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """BF16 linear through AITER's 256x256 pre-shuffled-B asm GEMM (gfx950).
+
+    The weight is shuffled in place into the (16, 16) layout on first use, so
+    afterwards ``layer.weight`` only feeds this kernel. For the MiniMax-H3 QKV
+    and gate+up shapes the kernel accumulates in the same order as the
+    hipBLASLt solutions it replaces and its output is bit-identical.
+    """
+    from aiter.ops.gemm_op_a16w16 import gemm_a16w16_asm
+
+    weight = layer.weight
+    if not getattr(layer, "_aiter_weight_shuffled", False):
+        from aiter.ops.shuffle import shuffle_weight
+
+        with torch.no_grad():
+            weight.data = shuffle_weight(weight.data, layout=(16, 16))
+        layer._aiter_weight_shuffled = True
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+    out = torch.empty(x_2d.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    gemm_a16w16_asm(x_2d, weight, out, bias, None, _AITER_BPRESHUFFLE_KERNEL, True)
+    return out.view(*x.shape[:-1], weight.shape[0])
 
 
 class LinearBase(torch.nn.Module):
