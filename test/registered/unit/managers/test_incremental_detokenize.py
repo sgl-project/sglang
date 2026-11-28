@@ -43,6 +43,11 @@ class _Tokenizer:
         return [self.decode(ids, **kwargs) for ids in ids_list]
 
 
+class _ByteTokenizer(_Tokenizer):
+    def decode(self, ids, **_kwargs):
+        return bytes(ids).decode("utf-8", errors="replace")
+
+
 def _header(prompt_tail_ids, *, skip_special_tokens=True, ipc="worker-a"):
     return DetokenizeHeader(
         prompt_tail_ids=array("q", prompt_tail_ids),
@@ -193,7 +198,47 @@ class TestDetokenizeState(CustomTestCase):
 
         self.assertEqual(out.output_strs, ["7."])
         self.assertEqual(out.http_worker_ipcs, ["worker-b"])
-        self.assertEqual(list(detok.detokenize_state_table.get("r").decode_ids), [6, 7])
+        state = detok.detokenize_state_table.get("r")
+        self.assertEqual(list(state.header.prompt_tail_ids), [6])
+
+    def test_long_stream_keeps_only_the_latest_decode_context(self):
+        detok = _detokenizer()
+        sent = {}
+        texts = []
+        for step in range(64):
+            header = _header([1, 2]) if step == 0 else None
+            output = detok.handle_batch_token_id_out(
+                _output(sent, [("r", [3, 4, 5, 6], header, False)])
+            )
+            texts.extend(output.output_strs)
+
+        state = detok.detokenize_state_table.get("r")
+        self.assertEqual(state.decode_ids, [3, 4, 5, 6])
+        self.assertEqual(state.num_received_ids, 256)
+
+        last_row = _output(sent, [("r", [7, 8], None, True)])
+        last_row.finished_reasons[0] = {"type": "stop", "matched": 8}
+        output = detok.handle_batch_token_id_out(last_row)
+        texts.extend(output.output_strs)
+
+        self.assertEqual("".join(texts), "3.4.5.6." * 64 + "7.")
+        self.assertIsNone(detok.detokenize_state_table.get("r"))
+
+    def test_split_utf8_keeps_uncommitted_tokens(self):
+        detok = _detokenizer()
+        detok.tokenizer = _ByteTokenizer()
+        sent = {}
+        encoded = "你".encode("utf-8")
+        rows = [
+            (list(b"hi "), _header(list(b"prompt")), "hi "),
+            (list(encoded[:2]), None, ""),
+            (list(encoded[2:]), None, "你"),
+        ]
+        for tokens, header, expected in rows:
+            output = detok.handle_batch_token_id_out(
+                _output(sent, [("r", tokens, header, False)])
+            )
+            self.assertEqual(output.output_strs, [expected])
 
     def test_a_row_without_state_drops_only_its_text(self):
         """A row still in flight when its request was released (overlap scheduling)
