@@ -839,7 +839,7 @@ class CausalDecodeQueue:
         ):
             video = self.vae.causal_decode(self._denormalize(latents))
             if self.encoder is not None:
-                # Postprocesses ``video`` in place and queues its frames.
+                # Postprocesses ``video`` into a new chunk tensor and queues its frames.
                 self.encoder(video)
             else:
                 host = torch.empty(
@@ -1540,7 +1540,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         return EncodeWhileDecoding(
             save_file_path,
             batch,
-            finish_frames=Cosmos3DecodingStage._postprocess_tensor,
+            finish_frames=Cosmos3DecodingStage._postprocess_streamed_chunk,
         )
 
     def _rollout_context(self, batch: Req, device: torch.device) -> _RolloutContext:

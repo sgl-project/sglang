@@ -892,6 +892,87 @@ class TestTransferDirectResize(unittest.TestCase):
                         )
                     )
 
+    def test_uncached_streamed_save_fallback_normalizes_once(self):
+        from sglang.multimodal_gen.configs.task_type import DataType
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            cosmos3,
+        )
+
+        raw = torch.linspace(-1.0, 1.0, 1 * 3 * 5 * 24 * 24).reshape(1, 3, 5, 24, 24)
+        expected = (raw * 0.5 + 0.5).clamp(0, 1).float()
+
+        class _FailingWriter:
+            def write(self, chunk):
+                raise RuntimeError("encoder write failed")
+
+            def abort(self):
+                pass
+
+        for mode, opener in (
+            ("open_none", lambda *_args, **_kwargs: None),
+            ("write_error", lambda *_args, **_kwargs: _FailingWriter()),
+        ):
+            with self.subTest(mode=mode):
+                decoded = raw.clone()
+
+                class _UncachedVae(torch.nn.Module):
+                    use_feature_cache = False
+                    supports_decode_on_frames = True
+
+                    def __init__(self):
+                        super().__init__()
+                        self.param = torch.nn.Parameter(torch.zeros(1))
+                        self.config = SimpleNamespace(scaling_factor=1.0)
+
+                    def decode(self, z, on_frames=None):
+                        if on_frames is not None:
+                            on_frames(decoded)
+                        return decoded
+
+                stage = CosmosDreamsTransferDecodingStage.__new__(
+                    CosmosDreamsTransferDecodingStage
+                )
+                stage.vae = _UncachedVae()
+                stage._latents_mean = stage._latents_std = None
+                stage._guardrails = False
+                stage.sound_tokenizer = None
+                stage.use_declared_component = lambda **_kwargs: contextmanager(
+                    lambda: (yield)
+                )()
+                stage.log_info = stage.log_debug = lambda *_args, **_kwargs: None
+                batch = SimpleNamespace(
+                    latents=torch.zeros(1, 4, 2, 3, 3),
+                    data_type=DataType.VIDEO,
+                    action_latents=None,
+                    audio_latents=None,
+                    use_guardrails=False,
+                    fps=24,
+                    num_frames=5,
+                    output_compression=None,
+                    x264_preset=None,
+                    extra={"transfer_plan": {"total_frames": 5}},
+                    sampling_params=SimpleNamespace(
+                        quality="exact",
+                        show_control_condition=False,
+                        show_input=False,
+                        transfer_output_size="model",
+                    ),
+                    metrics=None,
+                    rollout_trajectory_data=None,
+                )
+                with (
+                    mock.patch.object(
+                        cosmos3, "streamed_video_output_path", return_value="/tmp/t.mp4"
+                    ),
+                    mock.patch(
+                        "sglang.multimodal_gen.runtime.entrypoints.utils.CudaVideoEncoder.open",
+                        side_effect=opener,
+                    ),
+                ):
+                    result = stage.forward(batch, SimpleNamespace())
+                self.assertIsNone(result.output_file_paths)
+                self.assertTrue(torch.equal(result.output, expected))
+
     def test_config_mode_and_control_sentence_default(self):
         config = CosmosDreamsTransferConfig()
         self.assertEqual(config.transfer_resize_mode, "direct_resize")

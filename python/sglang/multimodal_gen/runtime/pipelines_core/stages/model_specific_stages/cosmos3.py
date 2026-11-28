@@ -2653,6 +2653,10 @@ class Cosmos3DecodingStage(PipelineStage):
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
         return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
+    @staticmethod
+    def _postprocess_streamed_chunk(decoded: torch.Tensor) -> torch.Tensor:
+        return decoded.mul(0.5).add_(0.5).clamp_(0, 1).float()
+
     def _streams_frames(self, batch: Req) -> bool:
         """Whether the plain video frames may go straight to the MP4, on every rank."""
         return not (
@@ -2675,7 +2679,7 @@ class Cosmos3DecodingStage(PipelineStage):
         if save_file_path is None:
             return None
         return EncodeWhileDecoding(
-            save_file_path, batch, finish_frames=self._postprocess_tensor
+            save_file_path, batch, finish_frames=self._postprocess_streamed_chunk
         )
 
     @staticmethod
