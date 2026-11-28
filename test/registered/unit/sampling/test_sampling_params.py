@@ -693,12 +693,13 @@ class TestSamplingParamsNormalize(CustomTestCase):
             {"enable_strict_thinking": True},
         ]
         for kwargs in conflict_cases:
-            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
-                ValueError, "trace_decode_token_ids cannot be combined"
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(
+                    ValueError, "trace_decode_token_ids cannot be combined"
+                ),
             ):
-                SamplingParams.validate_trace_decode_compatibility(
-                    [7], **kwargs
-                )
+                SamplingParams.validate_trace_decode_compatibility([7], **kwargs)
 
     def test_trace_decode_token_ids_rejects_empty_context_truncation(self):
         sampling_params = SamplingParams(trace_decode_token_ids=[7])

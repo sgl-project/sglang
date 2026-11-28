@@ -3635,9 +3635,7 @@ class Scheduler(
                     "Please set `--enable-trace-replay` to enable this feature."
                 )
             elif self.spec_algorithm.is_speculative():
-                error_msg = (
-                    "trace_decode_token_ids is only supported without speculative decoding."
-                )
+                error_msg = "trace_decode_token_ids is only supported without speculative decoding."
             elif self.disaggregation_mode != DisaggregationMode.NULL:
                 error_msg = (
                     "trace_decode_token_ids is not supported with PD disaggregation."

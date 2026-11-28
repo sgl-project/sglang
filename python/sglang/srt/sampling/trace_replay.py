@@ -1,13 +1,12 @@
 """Compact device storage and batch metadata for trace replay."""
 
+import hashlib
 from array import array
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-import hashlib
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.sampling import trace_replay as trace_replay_op
 from sglang.srt.utils.device import (
     async_h2d,
@@ -34,29 +33,31 @@ class TraceReplaySlot:
     length: int
 
     @property
-    def key(self) -> tuple[int, int, bytes]:
-        return (self.index, self.generation, self.fingerprint)
+    def key(self) -> tuple[int, int, bytes, int]:
+        return (self.index, self.generation, self.fingerprint, self.length)
 
 
 class TraceReplayPool:
     """Compact device token table storing rows only for active traced requests.
 
     Row 0 is reserved for non-trace entries. Active requests are mapped to
-    compact 1-based rows keyed by ``(req_pool_idx, generation, fingerprint)``,
-    so neither device memory nor host residency metadata scales with the full
-    request-pool capacity or retains finished token lists. Rows are uploaded on
-    the consuming stream, and a delayed sampler can restore its own trace from
-    its snapshot if a newer request reclaimed the row.
+    compact 1-based rows keyed by ``(req_pool_idx, generation, fingerprint,
+    length)``, so neither device memory nor host residency metadata scales with
+    the full request-pool capacity or retains finished token lists. Rows are
+    uploaded on the consuming stream, and a delayed sampler can restore its own
+    trace from its snapshot if a newer request reclaimed the row.
     """
 
     def __init__(self, req_pool):
         self.device = torch.device(req_pool.device)
+        self._req_generation = req_pool.req_generation
         self.max_rows = req_pool.req_generation.numel()
         self.max_width = req_pool.max_context_len
         self.tokens: Optional[torch.Tensor] = None
-        self._key_to_row: dict[tuple[int, int, bytes], int] = {}
-        self._row_to_key: dict[int, tuple[int, int, bytes]] = {}
-        self._row_lengths: dict[int, int] = {}
+        self._key_to_row: dict[tuple[int, int, bytes, int], int] = {}
+        self._row_to_key: dict[int, tuple[int, int, bytes, int]] = {}
+        self._row_last_used: dict[int, int] = {}
+        self._use_tick = 0
         self._stream = None
         self.revision = 0
 
@@ -107,18 +108,46 @@ class TraceReplayPool:
         else:
             self.tokens[0, 0] = 0
 
+    def _evict_row(self, row: int) -> None:
+        old_key = self._row_to_key.pop(row)
+        self._key_to_row.pop(old_key, None)
+        self._row_last_used.pop(row, None)
+
     def prepare(self, batch):
         self._use_current_stream()
+        self._use_tick += 1
         if (
             batch._prepared_revision == self.revision
             and batch._prepared_rows is not None
         ):
+            for slot in batch.slots:
+                if slot is not None:
+                    row = self._key_to_row.get(slot.key)
+                    if row is not None:
+                        self._row_last_used[row] = self._use_tick
             return self.tokens, batch._prepared_rows
 
         active_keys = {slot.key for slot in batch.slots if slot is not None}
-        reusable_rows = [
-            row for row, key in self._row_to_key.items() if key not in active_keys
-        ]
+        active_indices = {slot.index for slot in batch.slots if slot is not None}
+
+        # Prefer reclaiming rows whose request slot moved to a new generation
+        # or was reused by a new streaming-session turn, then unused allocated
+        # rows, then growing the table before evicting any live LRU row from
+        # another concurrent batch.
+        dead_rows: list[int] = []
+        live_other_rows: list[int] = []
+        for row, key in self._row_to_key.items():
+            if key in active_keys:
+                continue
+            req_idx, gen, _, _ = key
+            if int(self._req_generation[req_idx]) != gen or req_idx in active_indices:
+                dead_rows.append(row)
+            else:
+                live_other_rows.append(row)
+        live_other_rows.sort(
+            key=lambda row: self._row_last_used.get(row, 0), reverse=True
+        )
+
         allocated_rows = self.tokens.shape[0] if self.tokens is not None else 1
         free_rows = [
             row for row in range(1, allocated_rows) if row not in self._row_to_key
@@ -126,7 +155,7 @@ class TraceReplayPool:
         next_row = allocated_rows
 
         pending: list[tuple[int, TraceReplaySlot]] = []
-        assigned: dict[tuple[int, int, bytes], int] = {}
+        assigned: dict[tuple[int, int, bytes, int], int] = {}
         for slot in batch.slots:
             if slot is None:
                 continue
@@ -136,21 +165,22 @@ class TraceReplayPool:
             row = self._key_to_row.get(key)
             if row is not None:
                 assigned[key] = row
-                if self._row_lengths.get(row, 0) < slot.length:
-                    pending.append((row, slot))
+                self._row_last_used[row] = self._use_tick
                 continue
-            if free_rows:
+            if dead_rows:
+                row = dead_rows.pop()
+                self._evict_row(row)
+            elif free_rows:
                 row = free_rows.pop()
-            elif reusable_rows:
-                row = reusable_rows.pop()
-                old_key = self._row_to_key.pop(row)
-                self._key_to_row.pop(old_key, None)
-                self._row_lengths.pop(row, None)
-            else:
+            elif next_row < self.max_rows:
                 row = next_row
                 next_row += 1
+            else:
+                row = live_other_rows.pop()
+                self._evict_row(row)
             self._key_to_row[key] = row
             self._row_to_key[row] = key
+            self._row_last_used[row] = self._use_tick
             assigned[key] = row
             pending.append((row, slot))
 
@@ -164,7 +194,6 @@ class TraceReplayPool:
                     slot.token_ids[: slot.length], dtype=torch.int32, pin_memory=pin
                 )
                 self.tokens[row, : slot.length].copy_(host, non_blocking=pin)
-                self._row_lengths[row] = slot.length
             self.revision += 1
 
         row_indices = [
@@ -250,20 +279,14 @@ class TraceReplayBatch:
         slots = tuple(self.slots[i] for i in keep_indices)
         if not any(slot is not None for slot in slots):
             return None
-        prepared_rows = (
-            self._prepared_rows[keep_indices_device]
-            if self._prepared_rows is not None
-            else None
-        )
+        # Do not slice _prepared_rows on the schedule stream: it is written by
+        # prepare() on the forward stream, so leaving it None lets prepare()
+        # rebuild the compact row indices safely on the consumer stream.
         return TraceReplayBatch(
             self.pool,
             slots,
             self.lengths[keep_indices_device],
             self.steps[keep_indices_device],
-            _prepared_rows=prepared_rows,
-            _prepared_revision=(
-                self._prepared_revision if prepared_rows is not None else -1
-            ),
         )
 
     @classmethod

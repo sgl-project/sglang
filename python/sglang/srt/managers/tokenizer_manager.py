@@ -1573,9 +1573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.preferred_sampling_params
             else obj.sampling_params
         )
-        trace_decode_token_ids = request_sampling_params.get(
-            "trace_decode_token_ids"
-        )
+        trace_decode_token_ids = request_sampling_params.get("trace_decode_token_ids")
         if (
             trace_decode_token_ids is not None
             and not get_exec().features.enable_trace_replay

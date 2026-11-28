@@ -532,10 +532,15 @@ class TestTraceReplayBatch(CustomTestCase):
         self.assertEqual(
             apply_trace_decode_tokens(torch.tensor([30]), info).tolist(), [7]
         )
+        # Preparing a separate concurrent trace batch must grow the compact table
+        # rather than stealing the row of a still-live decoding request.
         self.assertEqual(
             apply_trace_decode_tokens(torch.tensor([30, 31]), right).tolist(), [13, 31]
         )
+        self.assertEqual(info.trace_replay.pool.tokens.shape[0], 4)
         snapshot = info.copy_for_forward().trace_replay
+        table = snapshot.pool.tokens
+        revision = snapshot.pool.revision
 
         info.advance_trace_decode_steps()
         info.trace_replay = TraceReplayBatch.merge(
@@ -545,8 +550,6 @@ class TestTraceReplayBatch(CustomTestCase):
             apply_trace_decode_tokens(torch.tensor([30, 31, 32]), info).tolist(),
             [8, 13, 32],
         )
-        table = info.trace_replay.pool.tokens
-        revision = info.trace_replay.pool.revision
         info.trace_replay = info.trace_replay.filter([0, 2], torch.tensor([0, 2]))
         self.assertEqual(
             apply_trace_decode_tokens(torch.tensor([30, 31]), info).tolist(), [8, 31]

@@ -396,9 +396,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         )
 
         if self.trace_decode_token_ids is not None:
-            if (
-                isinstance(self.trace_decode_token_ids, (str, bytes))
-                or not isinstance(self.trace_decode_token_ids, (list, tuple))
+            if isinstance(self.trace_decode_token_ids, (str, bytes)) or not isinstance(
+                self.trace_decode_token_ids, (list, tuple)
             ):
                 raise ValueError(
                     "trace_decode_token_ids must be a list of non-negative integers."
@@ -411,9 +410,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             if not self.trace_decode_token_ids:
                 raise ValueError("trace_decode_token_ids must not be empty.")
             if self.n != 1:
-                raise ValueError(
-                    "trace_decode_token_ids is only supported when n=1."
-                )
+                raise ValueError("trace_decode_token_ids is only supported when n=1.")
             if self.beam_width is not None and self.beam_width > 1:
                 raise ValueError(
                     "trace_decode_token_ids is not supported with beam search."
