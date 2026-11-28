@@ -16,6 +16,9 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
+    get_dcp_kv_prefetch,
+    maybe_consume_dcp_kv_split,
+    maybe_start_dcp_mha_prefetch,
 )
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -226,6 +229,21 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if (
+            forward_batch.mha_one_shot
+            and self.dcp_size > 1
+            and not self.use_dsa
+            and get_dcp_kv_prefetch() is not None
+            and not hasattr(resolve_attn_backend(forward_batch), "prepare_prefill_qkv")
+        ):
+            maybe_start_dcp_mha_prefetch(
+                self.attn_mha.layer_id,
+                forward_batch,
+                get_token_to_kv_pool(),
+                mode="mha_one_shot",
+                dst_dtype=self.kv_a_layernorm.weight.dtype,
+            )
+
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -305,6 +323,13 @@ class DeepseekMHAForwardMixin:
             else:
                 # BF16/FP16 path: directly fetch from cache
                 if self.dcp_size > 1:
+                    prefetched = (
+                        maybe_consume_dcp_kv_split(
+                            self.attn_mha.layer_id, 0, start_next=False
+                        )
+                        if not self.use_dsa
+                        else None
+                    )
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
@@ -313,6 +338,7 @@ class DeepseekMHAForwardMixin:
                         forward_batch.extend_seq_lens_cpu,
                         kv_a,
                         k_pe,
+                        prefetched=prefetched,
                     )
                 else:
                     kv_a, k_pe = self._get_mla_kv_buffer(
@@ -337,6 +363,11 @@ class DeepseekMHAForwardMixin:
         gate: Optional[torch.Tensor] = None,
         key_value_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
+        prefetcher = (
+            get_dcp_kv_prefetch() if self.dcp_size > 1 and not self.use_dsa else None
+        )
+        if prefetcher is not None and not forward_batch.mha_one_shot:
+            prefetcher.observe_layer(self.attn_mha.layer_id, forward_batch)
         attn_output = self.attn_mha(
             q,
             k,
@@ -345,6 +376,8 @@ class DeepseekMHAForwardMixin:
             save_kv_cache=False,
             key_value_num_tokens=key_value_num_tokens,
         )
+        if prefetcher is not None and forward_batch.mha_one_shot:
+            prefetcher.start_next(self.attn_mha.layer_id, 0)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
@@ -414,6 +447,20 @@ class DeepseekMHAForwardMixin:
             )
             output, _ = self.o_proj(attn_output)
             return output
+
+        if self.dcp_size > 1 and not self.use_dsa and get_dcp_kv_prefetch() is not None:
+            maybe_start_dcp_mha_prefetch(
+                self.attn_mha.layer_id,
+                forward_batch,
+                get_token_to_kv_pool(),
+                mode="mha_chunked",
+                dst_dtype=(
+                    torch.bfloat16
+                    if getattr(backend, "pack_prefix_chunk_kv", None) is not None
+                    else q.dtype
+                ),
+                has_prefix=has_extend_prefix,
+            )
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -552,6 +599,8 @@ class DeepseekMHAForwardMixin:
 
         assert forward_batch.num_prefix_chunks is not None
         packed_offset = 0
+        last_chunk = forward_batch.num_prefix_chunks - 1
+        defer_last_start = False
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
 
@@ -562,16 +611,31 @@ class DeepseekMHAForwardMixin:
                 v = packed_prefix_v[packed_offset:packed_end]
                 packed_offset = packed_end
             else:
-                kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-                kv_a_normed, k_pe = get_mla_kv_buffer(
-                    kv_indices, kv_a_dtype, forward_batch
+                prefetched = (
+                    maybe_consume_dcp_kv_split(
+                        self.attn_mha.layer_id, i, start_next=False
+                    )
+                    if self.dcp_size > 1 and not self.use_dsa
+                    else None
                 )
-                kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                    kv_a_normed,
-                    k_pe,
-                    forward_batch.prefix_chunk_seq_lens_cpu[i],
-                    forward_batch.prefix_chunk_starts_cpu[i],
-                )
+                start_after_pack = False
+                if prefetched is not None:
+                    kv_a_normed, k_pe = prefetched
+                    if i == last_chunk:
+                        defer_last_start = True
+                    else:
+                        start_after_pack = True
+                else:
+                    kv_indices = forward_batch.prefix_chunk_kv_indices[i]
+                    kv_a_normed, k_pe = get_mla_kv_buffer(
+                        kv_indices, kv_a_dtype, forward_batch
+                    )
+                    kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                        kv_a_normed,
+                        k_pe,
+                        forward_batch.prefix_chunk_seq_lens_cpu[i],
+                        forward_batch.prefix_chunk_starts_cpu[i],
+                    )
                 kv = self.kv_b_proj(kv_a_normed)[0]
                 kv = kv.view(
                     -1,
@@ -597,6 +661,11 @@ class DeepseekMHAForwardMixin:
                     k[..., : self.qk_nope_head_dim] = k_nope
                     k[..., self.qk_nope_head_dim :] = k_pe
                 del kv_a_normed, k_pe, kv, k_nope, v_dense
+                if (
+                    start_after_pack
+                    and (prefetcher := get_dcp_kv_prefetch()) is not None
+                ):
+                    prefetcher.start_next(self.attn_mha.layer_id, i)
 
             output, lse = self.attn_mha(
                 q,
@@ -621,6 +690,9 @@ class DeepseekMHAForwardMixin:
             )
             accum_output, accum_lse = tmp_output, tmp_lse
             del k, v, output, lse, tmp_output, tmp_lse
+
+        if defer_last_start and (prefetcher := get_dcp_kv_prefetch()) is not None:
+            prefetcher.start_next(self.attn_mha.layer_id, last_chunk)
 
         if pack_all_prefix_chunks:
             assert packed_offset == packed_prefix_k.shape[0]

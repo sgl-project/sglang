@@ -234,19 +234,23 @@ def all_gather_kv_cache_for_mha_extend(
     extend_seq_lens_cpu: list[int],
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
+    prefetched: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
-        attn_mqa.layer_id
-    ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
-    gathered_kv_cache = all_gather_kv_cache_for_dcp(
-        prefix_kv_a,
-        prefix_k_pe,
-        torch.tensor(extend_prefix_lens_cpu),
-    )
-    prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
-        [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
-    )
-    prefix_kv_a = prefix_kv_a.squeeze(1)
+    if prefetched is not None:
+        prefix_kv_a, prefix_k_pe = prefetched
+    else:
+        prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
+            attn_mqa.layer_id
+        ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
+        gathered_kv_cache = all_gather_kv_cache_for_dcp(
+            prefix_kv_a,
+            prefix_k_pe,
+            torch.tensor(extend_prefix_lens_cpu),
+        )
+        prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
+            [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
+        )
+        prefix_kv_a = prefix_kv_a.squeeze(1)
     # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
     # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
     if prefix_kv_a.dtype != kv_a.dtype:

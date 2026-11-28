@@ -42,6 +42,14 @@ from sglang.srt.layers.dcp.comm import (
     init_dcp_push_combine,
     init_fi_a2a_workspace,
 )
+from sglang.srt.layers.dcp.kv_prefetch import (
+    get_dcp_kv_prefetch,
+    init_dcp_kv_prefetch,
+    init_dcp_kv_prefetch_for_runner,
+    maybe_consume_dcp_kv_split,
+    maybe_fill_dcp_mla_extend_buffer,
+    maybe_start_dcp_mha_prefetch,
+)
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -59,6 +67,12 @@ __all__ = [
     "dcp_push_combine_fits",
     "dcp_push_combine_reduce",
     "init_dcp_push_combine",
+    "init_dcp_kv_prefetch",
+    "init_dcp_kv_prefetch_for_runner",
+    "get_dcp_kv_prefetch",
+    "maybe_consume_dcp_kv_split",
+    "maybe_fill_dcp_mla_extend_buffer",
+    "maybe_start_dcp_mha_prefetch",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",

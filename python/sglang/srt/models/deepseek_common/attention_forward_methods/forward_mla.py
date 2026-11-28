@@ -30,6 +30,8 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
+    get_dcp_kv_prefetch,
+    maybe_fill_dcp_mla_extend_buffer,
 )
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
@@ -115,6 +117,10 @@ def bcg_dcp_extend_kv_gather(
     if is_in_prefill_graph_scope():
         forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
+    if maybe_fill_dcp_mla_extend_buffer(
+        token_to_kv_pool, attn_mqa.layer_id, forward_batch, kv_lora_rank, k_nope, k_pe
+    ):
+        return
     if metadata.dcp_extend_prefix_lens_sum == 0:
         # No prefix KV on any DCP rank: skip the collective. The buffer holds the
         # real tokens; a replayed k_nope/k_pe is padded to the bucket.
@@ -997,6 +1003,14 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+
+        if (
+            self.dcp_size > 1
+            and not self.use_dsa
+            and forward_batch.forward_mode.is_extend()
+            and (prefetcher := get_dcp_kv_prefetch()) is not None
+        ):
+            prefetcher.start_next(self.attn_mqa.layer_id, 0)
 
         dcp_v_projected = False
         # correct attn_output with respect to lse from other ranks

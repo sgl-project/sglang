@@ -2712,6 +2712,9 @@ class Envs:
     # kernels/ops/attention/dcp_push_combine.py.
     SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
     SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(_k31_gb_best(1536, 1024))
+    # DCP MLA extend: overlap historical prefix KV all-gathers behind compute
+    # using a dedicated zero-SM copy-engine stream over symmetric memory.
+    SGLANG_ENABLE_DCP_KV_PREFETCH = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
