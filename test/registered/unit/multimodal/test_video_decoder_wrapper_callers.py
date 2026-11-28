@@ -13,8 +13,11 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import torch
+from transformers import Gemma4Processor, Gemma4VideoProcessor
 
 from sglang.srt.multimodal.processors import ernie45_vl
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
 from sglang.srt.multimodal.processors.nvila import NVILAMultimodalProcessor
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +68,45 @@ class TestVideoDecoderWrapperCallers(CustomTestCase):
         self.assertEqual((height % 28, width % 28), (0, 0))
         self.assertEqual(metadata["fps"], 8.0)
         self.assertEqual(metadata["total_num_frames"], 16)
+
+    def test_gemma4_video_prompt_uses_source_timestamps(self):
+        """Pre-sampling a video must not reset the clock used in the prompt."""
+        video = _InMemoryVideo(_frames(300, 48, 48), fps=30.0)
+        processor = Gemma4SGLangProcessor.__new__(Gemma4SGLangProcessor)
+        processor._processor = Gemma4Processor.__new__(Gemma4Processor)
+        processor._processor.video_processor = Gemma4VideoProcessor(num_frames=4)
+        processor._processor.boi_token = "<image>"
+        processor._processor.video_token = "<frame>"
+        processor._processor.eoi_token = "</image>"
+
+        def render(_, videos, **kwargs):
+            outputs = processor._processor.video_processor(
+                videos,
+                video_metadata=kwargs.get("videos_kwargs", {}).get("video_metadata"),
+                do_sample_frames=kwargs["do_sample_frames"],
+                do_resize=False,
+                return_metadata=True,
+            )
+            return [
+                processor._processor.replace_video_token(outputs, i).split()[::2]
+                for i in range(len(videos))
+            ]
+
+        raw_frames = torch.zeros(4, 3, 48, 48, dtype=torch.uint8)
+        with patch.object(
+            BaseMultimodalProcessor, "process_mm_data", side_effect=render
+        ):
+            timestamps = processor.process_mm_data(
+                "<video><video>", videos=[video, raw_frames]
+            )
+
+        self.assertEqual(
+            timestamps,
+            [
+                ["00:00", "00:02", "00:05", "00:07"],
+                ["00:00", "00:00", "00:00", "00:00"],
+            ],
+        )
 
     def test_nvila_passes_decoded_frames_to_the_hf_processor(self):
         frames = _frames(4, 8, 8)
