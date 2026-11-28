@@ -2100,6 +2100,7 @@ def aiter_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    bpreshuffled: bool = False,
 ) -> torch.Tensor:
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
@@ -2160,6 +2161,8 @@ def aiter_w8a8_block_fp8_linear(
         return output.to(dtype=out_dtype).view(*output_shape)
 
     n, k = weight.shape
+    # gfx942: Fp8LinearMethod passes bpreshuffled for a weight it preshuffled at load.
+    use_bp_gemm = _use_aiter_bpreshuffle_gfx95 or bpreshuffled
 
     # decode-sized M on gfx950: the 1x128 activation quant fused into the GEMM
     if _use_aiter_bpreshuffle_gfx95 and input_scale is None and bias is None:
@@ -2188,14 +2191,14 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
+        if use_bp_gemm and not use_triton:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
     else:
-        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        materialize_bpreshuffle_scale = use_bp_gemm and not use_triton
         # No-copy bpreshuffle scale: emit it already transposed and stride-reinterpret
         # to the column-major bpreshuffle layout, instead of a .t().contiguous().t()
         # copy. Bit-identical for M>=2; M==1 keeps materialize (there the [1,G] and
@@ -2215,7 +2218,7 @@ def aiter_w8a8_block_fp8_linear(
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    elif _use_aiter_bpreshuffle_gfx95:
+    elif use_bp_gemm:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
