@@ -2396,7 +2396,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                 planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
             )
 
-    def test_npu_v4_budget_covers_bf16_kv_and_physical_pages(self):
+    def test_npu_v4_budget_uses_bf16_kv_rows(self):
         configurator = "sglang.srt.model_executor.pool_configurator"
         npu_utils = "sglang.srt.hardware_backend.npu.utils"
         with (
@@ -2408,7 +2408,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             planner.bytes_per_full_token = planner._get_bytes_per_full_token()
             logical_swa = 1280 * 1024 * 2 + 80 * (512 + 128) * 4 * 4
             self.assertEqual(planner._get_swa_fixed_bytes(), logical_swa)
-            budget = logical_swa + 3232 * (1024 + 130) + 112 * 1024 + 640 * 512 * 2 * 4
+            budget = logical_swa + 3200 * (1024 + 130) + 100 * 1024 + 640 * 512 * 2 * 4
             self.assertEqual(
                 planner.calculate_pool_sizes(budget, 128).max_total_num_tokens, 12800
             )
@@ -2418,6 +2418,12 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             )
             planner.ring_sizes[128] = 256
             self.assertEqual(planner._get_c128_state_fixed_bytes(2), 1280 * 512 * 2 * 4)
+            planner.swa_cap_tokens = None
+            planner.swa_ratio = 0.1
+            self.assertEqual(
+                planner._get_npu_kv_padding_bytes(12800),
+                128 * 1024 * 2 + 16 * (512 + 128) * 4 * 4,
+            )
 
     def test_npu_v41_budget_uses_distinct_swa_and_compressed_rows(self):
         configurator = "sglang.srt.model_executor.pool_configurator"
@@ -2432,7 +2438,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             # All three layers own SWA; only the two sources own compressed
             # rows. Indexer storage includes the reserved FULL and index pages.
             budget = (
-                384 * 544 * 3 + (640 + 320) * 320 + (768 + 384) * 68 + 10 * 512 * 2 * 4
+                512 * 544 * 3 + (640 + 320) * 320 + (768 + 384) * 68 + 10 * 512 * 2 * 4
             )
             self.assertEqual(
                 planner.calculate_pool_sizes(budget, 128).max_total_num_tokens, 512

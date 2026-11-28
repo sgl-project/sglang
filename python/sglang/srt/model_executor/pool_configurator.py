@@ -1586,14 +1586,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         arch35 = is_npu_arch35()
-        is_v41 = any(
+        self._npu_is_v41 = any(
             ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
         )
         v4_layout = NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
         self._npu_kv_row_bytes = {}
         for ratio in (0, *self.stage_owner_layers):
             layout = v4_layout
-            if is_v41:
+            if self._npu_is_v41:
                 if ratio == 0:
                     layout = (
                         NPUDSV4KVLayout.V41_SWA_FP8
@@ -1615,12 +1615,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.indexer_bytes_per_token = (
             k * k_dtype.itemsize + scale * scale_dtype.itemsize
         )
-        self._npu_c128_page_size = get_schedule().c128_page_size
-        if self._npu_c128_page_size <= 0 or self._npu_c128_page_size % 16 != 0:
-            raise ValueError(
-                "c128_page_size must be a positive multiple of 16 for the NPU "
-                f"sparse-attention operator, got {self._npu_c128_page_size}"
-            )
 
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
@@ -1749,17 +1743,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
     def _get_npu_kv_padding_bytes(self, full_tokens: int) -> float:
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DSV41_INDEX_PAGE_SIZE,
-        )
+        if self._npu_is_v41:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                DSV41_INDEX_PAGE_SIZE,
+            )
+
+            # V4.1 uses the upstream SWA and low-ratio reserved-page budget.
+            swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
+            padding_bytes = self.page_size * self.kv_bytes * swa_layers
+            for ratio in (1, 2):
+                num_layers = self.num_layers(ratio)
+                if not num_layers:
+                    continue
+                # FULL capacity is aligned, so main KV allocates one reserved page.
+                page = self.page_size // ratio
+                main_padding = page * self._get_paged_kv_bytes_per_token(ratio)
+                index_size = (full_tokens + self.page_size) // ratio
+                index_page = DSV41_INDEX_PAGE_SIZE
+                index_rows = ((index_size + index_page + 1) // index_page) * index_page
+                index_padding = (
+                    index_rows - full_tokens // ratio
+                ) * self.low_ratio_index_bytes
+                padding_bytes += (main_padding + index_padding) * num_layers
+            # Keep the upstream A3 V4.1 padding budget unscaled.
+            if self._npu_low_ratio_bf16:
+                return padding_bytes
+            return padding_bytes * self._spec_infl
 
         padding_bytes = 0
-        swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
         if self.swa_cap_tokens is None:
             swa_tokens = self._get_swa_tokens(full_tokens, self.page_size)
             rounded_off = full_tokens * self.swa_ratio - swa_tokens
             # Page-aligned SWA capacity gets one reserved physical page.
-            padding_bytes += (self.page_size - rounded_off) * self.kv_bytes * swa_layers
+            padding_bytes += (
+                (self.page_size - rounded_off) * self.kv_bytes * self.num_swa_layers
+            )
             num_c4_layers = self.num_layers(4)
             if num_c4_layers:
                 ring = self.ring_sizes[4]
@@ -1774,25 +1792,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     * torch.float32.itemsize
                 )
                 padding_bytes += extra_state_rows * state_row_bytes * num_c4_layers
-        elif self._npu_low_ratio_bf16:
-            # Preserve the upstream A3 V4.1 cap-mode reserved page.
-            padding_bytes += self.page_size * self.kv_bytes * swa_layers
-        for ratio, layers in self.stage_owner_layers.items():
-            size = full_tokens // ratio
-            page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
-            rows = ((size + page + 1) // page) * page
-            layer_bytes = rows * self._npu_kv_row_bytes[ratio]
-            if ratio == 4:
-                layer_bytes += rows * self.indexer_bytes_per_token
-            elif ratio in (1, 2):
-                index_size = (full_tokens + self.page_size) // ratio
-                index_page = DSV41_INDEX_PAGE_SIZE
-                index_rows = ((index_size + index_page + 1) // index_page) * index_page
-                layer_bytes += index_rows * self.low_ratio_index_bytes
-            logical_layer_bytes = full_tokens * self._compressed_bytes_per_full_token(
-                ratio
-            )
-            padding_bytes += (layer_bytes - logical_layer_bytes) * len(layers)
         return padding_bytes * self._spec_infl
 
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
