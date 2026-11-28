@@ -18,9 +18,6 @@ register_npu_ci(
 
 logger = logging.getLogger(__name__)
 
-# Temperature=0 runs were observed to differ by 4-6 questions (more than the
-# 5-question tolerance), so the case pins a deterministic HCCL reduction order.
-#
 # Fail fast when the NEXTN draft model stops being accepted. When acceptance
 # collapses (accept length ~1.0, accept rate ~0.0) decoding is several times
 # slower and this 198-question GPQA run cannot finish within the nightly
@@ -38,9 +35,13 @@ QWEN3_6_27B_3K5_1K5_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
-    # Fixed HCCL reduction order; CANN 9.2.0 only accepts true/false/strict.
-    "HCCL_DETERMINISTIC": "true",
-    # No-op in CI (the nightly stage already exports it); pins the GDN path
+    # HCCL_DETERMINISTIC removed to re-measure the temperature=0 drift over
+    # a few nightly runs; put back "HCCL_DETERMINISTIC": "true" if accuracy
+    # failures beyond the 5-question tolerance reappear.
+    # GDN attention path used by the other qwen3.6-27b cases
+    # (test_npu_qwen3_6_27b_1p_gpqa.py and
+    # test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py). The nightly stage
+    # already exports this, so it is a no-op in CI and only pins the value
     # when the case runs outside the CI wrapper.
     "GDN_ATTN_BACKEND_TRITON": "1",
 }
