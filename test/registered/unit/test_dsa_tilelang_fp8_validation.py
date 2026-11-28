@@ -140,8 +140,10 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
             qk_rope_head_dim=64,
         )
 
-    def test_cuda_fp8_non_tilelang_allowed(self):
-        # fp8-capable backends must pass
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    def test_cuda_fp8_non_tilelang_allowed(self, _capability):
+        # fp8-capable backends must pass; (10, 0) is an arch the pinned
+        # flashinfer builds the trtllm TRT-LLM-GEN MLA kernels for.
         _check_tilelang_dsa_fp8_kv(
             "fp8_e4m3",
             "flashmla_kv",
