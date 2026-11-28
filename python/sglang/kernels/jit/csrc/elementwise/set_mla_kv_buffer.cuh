@@ -143,7 +143,6 @@ struct SetMlaKVBufferKernel {
     const auto kernel = loc_dtype.is_type<int32_t>() ? set_kernel<int32_t> : set_kernel<int64_t>;
     const auto num_warps = [&] {
       const auto sm_count = runtime::get_sm_count(device.device_id);
-#pragma unroll
       for (uint32_t n : {1, 2, 4}) {
         if (batch_size <= sm_count * n) return n;
       }
