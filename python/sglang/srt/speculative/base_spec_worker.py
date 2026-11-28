@@ -270,6 +270,10 @@ class BaseSpecWorker(ABC):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         return self.target_worker.model_runner.prewarm_sampling()
 
+    def prewarm_after_kv_sizing(self) -> None:
+        """First-use work of decoding that needs the final KV pool, run before
+        the server is ready."""
+
     @property
     def preloaded_weights_bytes(self) -> int:
         if self.draft_worker is None:

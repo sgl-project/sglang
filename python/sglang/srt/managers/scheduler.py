@@ -1272,6 +1272,12 @@ class Scheduler(
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
 
+        if self.draft_worker is not None:
+            # Weights and pool addresses are final: run decoding's first-use
+            # graph captures and compiles before readiness, not under traffic.
+            with device_module.stream(forward_stream):
+                self.draft_worker.prewarm_after_kv_sizing()
+
         # Adaptive/speculative graphs and post-capture KV sizing can consume
         # the headroom seen by the initial DeepGEMM layout budget. Refresh it
         # after these allocations, before elastic EP rejoins healthy ranks
