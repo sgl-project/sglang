@@ -64,6 +64,8 @@ from sglang.srt.layers.moe.utils import (
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -142,6 +144,41 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _dsa_qproj_to_bf16(model: nn.Module) -> None:
+    """Dequantize the DSA layers' FP8 block-128 q_a (fused with kv_a) and q_b
+    projections to bf16 before the loader's post-load pass; the forward then takes
+    the bf16 RMSNorm path and skips the activation group quant. A projection whose
+    weight process_weights_after_loading already re-laid out stays FP8."""
+    n = 0
+    for module in model.modules():
+        for name in ("fused_qkv_a_proj_with_mqa", "q_b_proj"):
+            proj = getattr(module, name, None)
+            method = getattr(proj, "quant_method", None)
+            scale = getattr(proj, "weight_scale_inv", None)
+            if (
+                type(method) is not Fp8LinearMethod
+                or list(method.weight_block_size or ()) != [128, 128]
+                or scale is None
+                or proj.weight.dtype != torch.float8_e4m3fn
+                or getattr(proj, "aiter_bpreshuffled", False)
+                or getattr(proj, "block_fp8_mxfp8_ready", False)
+            ):
+                continue
+            rows, cols = proj.weight.shape
+            s = scale.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[
+                :, :cols
+            ]
+            w = (proj.weight.float() * s).to(torch.bfloat16)
+            proj.weight = nn.Parameter(w, requires_grad=False)
+            delattr(proj, "weight_scale_inv")
+            proj.quant_method = UnquantizedLinearMethod()
+            n += 1
+    if n:
+        logger.info("DSA q_a / q_b projections: FP8 block-128 -> bf16 (%d)", n)
+        torch.cuda.empty_cache()
+
 
 # Matches deepseek_v4_mhc.MHC_POST_MULT_VALUE; the fused and unfused boundaries
 # must agree on it.
@@ -2111,6 +2148,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+        if _use_aiter_gfx95 and isinstance(self, nn.Module):
+            _dsa_qproj_to_bf16(self)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -2120,6 +2159,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         # Loaders that skip load_weights (dummy, sharded state, remote instance)
         # call only this.
+        if _use_aiter_gfx95:
+            _dsa_qproj_to_bf16(self)
         if not is_nextn:
             self._prepare_fused_decode_layers()
 

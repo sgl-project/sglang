@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,14 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
+from sglang.srt.utils import (
+    ceil_align,
+    is_cuda,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+)
 
 if is_cuda():
     try:
@@ -62,7 +69,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +95,51 @@ def _slice_rows(
     *, tensor: Optional[torch.Tensor], rows: slice
 ) -> Optional[torch.Tensor]:
     return None if tensor is None else tensor[rows]
+
+
+# Below this many requests a rank's share of the logits is too small to pay for
+# the top-k all-gather.
+_KPOOL_TP_SPLIT_MIN_REQS = 4
+
+
+class _KpoolTpSplit(NamedTuple):
+    group: Any
+    rank: int
+    # rank r scores requests [bounds[r], bounds[r + 1])
+    bounds: Tuple[int, ...]
+    reqs_per_rank: int
+    next_n: int
+
+
+def _kpool_indexer_tp_split(
+    forward_batch: ForwardBatch, n_real: int, next_n: int
+) -> Optional[_KpoolTpSplit]:
+    # Every input is identical across the group, so all ranks take the same
+    # branch and the all-gather cannot diverge.
+    if not is_hip():
+        return None
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return None
+    group = get_parallel().attn_tp_group
+    world = group.world_size
+    reqs = n_real // next_n
+    if world <= 1 or reqs * next_n != n_real:
+        return None
+    if reqs < max(world, _KPOOL_TP_SPLIT_MIN_REQS):
+        return None
+    # Whole blocks of reqs_per_rank requests in rank order (the last ranks may
+    # get fewer or none): the gathered top-k holds the real rows in order up
+    # front, so no rank pads and nothing is re-packed after the gather.
+    per = -(-reqs // world)
+    bounds = tuple(min(r * per, reqs) for r in range(world + 1))
+    return _KpoolTpSplit(
+        group=group,
+        rank=group.rank_in_group,
+        bounds=bounds,
+        reqs_per_rank=per,
+        next_n=next_n,
+    )
 
 
 def _mqa_logits_row_chunks(
@@ -230,6 +282,8 @@ class IndexerKPool(MultiPlatformOp):
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        # [wk | compress gate | weights_proj] in bf16, built by fuse_x_projections().
+        self.x_proj_weight: Optional[torch.Tensor] = None
         if not self.skip_rope:
             self.rotary_emb = get_rope_wrapper(
                 rope_head_dim,
@@ -252,20 +306,89 @@ class IndexerKPool(MultiPlatformOp):
         return weights
 
     @torch.compile(dynamic=True)
-    def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
+    def _project_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
-        return weights * self.n_heads**-0.5
+        return weights
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ) -> torch.Tensor:
+        weights = weights * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _resolve_head_gate_weights(self, x, q_scale, head_weights):
+        """head_weights: the unscaled weights_proj output, when already computed."""
         if head_weights is not None:
             return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
         return self._get_logits_head_gate(x, q_scale)
+
+    def fuse_x_projections(self) -> None:
+        """Stack wk, the compress gate and weights_proj into x_proj_weight, so the
+        target-verify path projects x once (fp32 out) instead of three GEMMs.
+
+        Must run again after any of the three is reloaded. An existing stack is
+        refreshed in place: captured CUDA graphs keep reading its address, so they
+        cannot fall back to the unfused path, and a reload that the bf16 stack cannot
+        hold exactly is rejected."""
+        if not is_gfx95_supported():
+            return
+        wk = getattr(self.wk, "weight", None)
+        head = self.weights_proj.weight
+        if (
+            (not self.skip_rope and self.rope_head_dim > 0)
+            or wk is None
+            or wk.dtype != torch.bfloat16
+            or self.index_kpool_compress_gate.dtype != torch.bfloat16
+            or not (self.k_norm.elementwise_affine and self.k_norm.use_bias)
+        ):
+            return
+        # weights_proj is held in fp32 but loaded from bf16: stacking it must be exact
+        head_exact = torch.equal(head.bfloat16().float(), head.float())
+        parts = [wk.data, self.index_kpool_compress_gate.data, head.data.bfloat16()]
+        if self.x_proj_weight is None:
+            if head_exact:
+                self.x_proj_weight = torch.cat(parts).contiguous()
+            return
+        if not head_exact:
+            raise ValueError(
+                f"Layer {self.layer_id}: reloaded indexer weights_proj is not bf16-exact, "
+                "but target verify already runs on the bf16 stacked x projection; send "
+                "bf16-representable weights_proj values."
+            )
+        torch.cat(parts, out=self.x_proj_weight)
+
+    def _use_fused_x_proj(self) -> bool:
+        """The stack holds base weights only, built before LoRA wraps any module: an
+        adapter on wk or weights_proj must take the unfused path, which applies it.
+        wq_b runs as a module call on both paths."""
+        return self.x_proj_weight is not None and not any(
+            getattr(getattr(self, name, None), "set_lora", False)
+            for name in ("wk", "weights_proj")
+        )
+
+    def _get_q_k_fused_x_proj(
+        self, q_lora: torch.Tensor, x: torch.Tensor, norm_and_rotate: bool = True
+    ):
+        """``norm_and_rotate=False`` returns the fp32 key projection and the query
+        before its Hadamard rotation; the caller applies ``k_norm`` and the rotation."""
+        from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+
+        d = self.head_dim
+        proj = torch.mm(x, self.x_proj_weight.t(), out_dtype=torch.float32)
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=d)
+        if not norm_and_rotate:
+            return query, proj[:, :d], proj[:, d : 2 * d], proj[:, 2 * d :]
+        key = torch.empty(x.shape[0], d, dtype=torch.bfloat16, device=x.device)
+        _layer_norm_fwd(
+            proj[:, :d],
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            out=key,
+        )
+        return rotate_activation(query), key, proj[:, d : 2 * d], proj[:, 2 * d :]
 
     def _can_overlap_prefill(
         self,
@@ -667,7 +790,7 @@ class IndexerKPool(MultiPlatformOp):
                     dim=-1,
                 )
             if precompute_head_gate:
-                head_weights = self._project_and_scale_head_gates(x)
+                head_weights = self._project_head_gates(x)
             if not apply_rope:
                 query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
@@ -756,6 +879,7 @@ class IndexerKPool(MultiPlatformOp):
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
         topk_v2_plan: Optional[torch.Tensor] = None,
+        pad_rows_unset: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -785,6 +909,45 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
             topk_v2_plan=topk_v2_plan,
+            pad_rows_unset=pad_rows_unset,
+        )
+
+    @staticmethod
+    def _kpool_verify_next_n_layout(
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        pool_seqlens: torch.Tensor,
+        pool_block_tables: torch.Tensor,
+        n_real: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """AITER paged-MQA inputs that score each request's draft rows as one
+        ``next_n`` query, so every split of a request runs on one XCD.
+
+        A request's draft rows share one page table, so row ``b * next_n`` read
+        ``next_n`` rows wide is that request's table; blocks past its width
+        fall in the request's own duplicate rows and only feed columns the
+        kernel's ``max_model_len`` store mask drops.
+        """
+        plan = metadata.attn_metadata.kpool_write_plan
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or plan is None
+            or plan.pool_context_lens_per_req is None
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        next_n = plan.num_draft_tokens
+        if (
+            next_n <= 1
+            or n_real % next_n != 0
+            or pool_block_tables.shape[0] < n_real
+            or not pool_block_tables.is_contiguous()
+        ):
+            return pool_seqlens, pool_block_tables, 1
+        bs = n_real // next_n
+        return (
+            plan.pool_context_lens_per_req[:bs],
+            pool_block_tables[:n_real].view(bs, -1),
+            next_n,
         )
 
     def _get_kpool_decode_metadata(
@@ -1023,6 +1186,7 @@ class IndexerKPool(MultiPlatformOp):
             build_schedule_metadata=not (use_aiter_paged_mqa or use_tilelang_paged_mqa),
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+        split = None
         if use_aiter_paged_mqa:
             # kpool_fp8_index writes in AITER's tile order, so a row-major reader would misread the cache
             if not aiter_can_use_preshuffle_paged_mqa():
@@ -1034,15 +1198,38 @@ class IndexerKPool(MultiPlatformOp):
                 )
             from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
 
+            mqa_seqlens, mqa_block_tables, mqa_next_n = (
+                self._kpool_verify_next_n_layout(
+                    forward_batch, metadata, pool_seqlens, pool_block_tables, n_real
+                )
+            )
+            split = _kpool_indexer_tp_split(forward_batch, n_real, mqa_next_n)
+            if split is not None:
+                topk_split = self._get_topk_paged_tp_split(
+                    split,
+                    q_fp8=q_fp8,
+                    kv_cache_fp8=kv_cache_fp8,
+                    weights=weights,
+                    mqa_seqlens=mqa_seqlens,
+                    mqa_block_tables=mqa_block_tables,
+                    pool_max_seq_len=pool_max_seq_len,
+                    pool_seqlens=pool_seqlens,
+                    seqlens_32=seqlens_32,
+                    metadata=metadata,
+                    num_q_padded=num_q_padded,
+                    kv_block_size=block_kv,
+                )
+                return topk_split
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                pool_seqlens,
-                pool_block_tables,
+                mqa_seqlens,
+                mqa_block_tables,
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+                next_n=mqa_next_n,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -1082,6 +1269,81 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
         return topk_result
+
+    def _get_topk_paged_tp_split(
+        self,
+        split: _KpoolTpSplit,
+        *,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        mqa_seqlens: torch.Tensor,
+        mqa_block_tables: torch.Tensor,
+        pool_max_seq_len: int,
+        pool_seqlens: torch.Tensor,
+        seqlens_32: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        num_q_padded: int,
+        kv_block_size: int,
+    ) -> torch.Tensor:
+        """Score this rank's requests only, then all-gather the ranks' top-k.
+
+        A row's logits and top-k read only that row's query, keys, lengths and
+        page-table row, so each rank's rows equal the unsplit pass's.
+        """
+        from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            build_kpool_topk_v2_plan,
+        )
+
+        next_n = split.next_n
+        req_lo, req_hi = split.bounds[split.rank], split.bounds[split.rank + 1]
+        rows = slice(req_lo * next_n, req_hi * next_n)
+        rows_per = split.reqs_per_rank * next_n
+        reqs = slice(req_lo, req_hi) if next_n > 1 else rows
+
+        # Rows past this rank's requests land past the real rows of the
+        # gather, which only the first n_real rows of are read.
+        if req_hi == req_lo:
+            cols = self.index_topk + self.index_kpool - 1
+            local = q_fp8.new_empty((rows_per, cols), dtype=torch.int32)
+        else:
+            logits = aiter_paged_mqa_logits(
+                q_fp8[rows],
+                kv_cache_fp8,
+                weights[rows],
+                mqa_seqlens[reqs],
+                mqa_block_tables[reqs],
+                pool_max_seq_len,
+                preshuffle=True,
+                kv_block_size=kv_block_size,
+                next_n=next_n,
+            )
+            pool_lens = pool_seqlens[rows]
+            page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
+            local = self._topk_from_kpool_logits(
+                logits=logits,
+                pool_lens=pool_lens,
+                topk_v2_plan=build_kpool_topk_v2_plan(pool_lens),
+                seq_lens=seqlens_32[rows],
+                page_table=_slice_rows(tensor=page_table_1, rows=rows),
+                topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
+                out_rows=rows_per if rows.stop - rows.start < rows_per else None,
+                pad_rows_unset=True,
+            )
+
+        world = split.group.world_size
+        gathered = local.new_empty((world * rows_per, local.shape[1]))
+        # Aiter's custom all-gather takes float dtypes only; a gather copies bits.
+        split.group.all_gather_into_tensor(
+            gathered.view(torch.float32), local.contiguous().view(torch.float32)
+        )
+        n_real = split.bounds[-1] * next_n
+        if num_q_padded == n_real:
+            return gathered[:n_real]
+        out = gathered.new_full((num_q_padded, local.shape[1]), -1)
+        out[:n_real] = gathered[:n_real]
+        return out
 
     def _kpool_topk_by_row_chunks(
         self,
@@ -1564,17 +1826,31 @@ class IndexerKPool(MultiPlatformOp):
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
-            q_lora,
-            x,
-            positions,
-            enable_dual_stream=enable_dual_stream,
-            forward_batch=forward_batch,
-            precompute_compress_gate=(
-                enable_dual_stream and self.compress_gate_stream is not None
-            ),
-            precompute_head_gate=enable_dual_stream and return_indices,
+        fused_x_proj = self._use_fused_x_proj()
+        # On one stream, the k-pool write launch also applies the key LayerNorm and
+        # rotates and quantizes the query.
+        fuse_write_quant = (
+            fused_x_proj
+            and return_indices
+            and not enable_dual_stream
+            and self.head_dim == self.block_size
         )
+        if fused_x_proj:
+            query, key, gate_score_maybe, head_weights = self._get_q_k_fused_x_proj(
+                q_lora, x, norm_and_rotate=not fuse_write_quant
+            )
+        else:
+            query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
+                q_lora,
+                x,
+                positions,
+                enable_dual_stream=enable_dual_stream,
+                forward_batch=forward_batch,
+                precompute_compress_gate=(
+                    enable_dual_stream and self.compress_gate_stream is not None
+                ),
+                precompute_head_gate=enable_dual_stream and return_indices,
+            )
 
         pool = get_token_to_kv_pool()
         tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
@@ -1585,11 +1861,25 @@ class IndexerKPool(MultiPlatformOp):
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
-        def _compress_write() -> None:
+        fused_quant_args = {}
+        if fuse_write_quant:
+            fused_quant_args = dict(
+                key_norm=(
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                ),
+                query=query,
+                head_weights=head_weights,
+                head_scale=self.n_heads**-0.5,
+                softmax_scale=self.softmax_scale,
+            )
+
+        def _compress_write():
             # Only rows covered by the write plan belong to verify sequences;
             # trailing MoE padding must not update per-request KPool state.
             num_write_tokens = plan.req.shape[0] * num_draft_tokens
-            kpool_write_tail_and_maybe_compress(
+            return kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
                 key=key[:num_write_tokens],
@@ -1607,12 +1897,15 @@ class IndexerKPool(MultiPlatformOp):
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
+                **fused_quant_args,
             )
 
-        if enable_dual_stream:
+        if fuse_write_quant:
+            q_fp8, q_scale, weights = _compress_write()
+        elif enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if gate_score_maybe is not None:
+            if gate_score_maybe is not None and not fused_x_proj:
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:

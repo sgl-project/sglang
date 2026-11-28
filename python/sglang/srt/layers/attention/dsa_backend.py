@@ -152,6 +152,7 @@ if _IS_GFX95:
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -820,6 +821,9 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        self._is_draft_runner = model_runner.is_draft_worker
+        self._skip_prefill = skip_prefill
+        self._verify_mask = None
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
@@ -2062,6 +2066,10 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -2071,6 +2079,24 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # Target verify never reads the tree mask (sparse attention takes its
+        # causal chain from the top-k plan), so declare it unread: the worker
+        # then builds a topk=1 chain with one kernel instead of filling a
+        # seq_lens_sum-wide FULL_MASK.
+        if _is_hip:
+            from sglang.srt.layers.attention.verify_mask import (
+                maybe_create_verify_mask,
+            )
+
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self._is_draft_runner,
+                skip_prefill=self._skip_prefill,
+                max_bs=max_bs,
+                max_kv_len=self.max_kv_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=False,
+            )
         # Whether we can skip the wide [max_num_tokens, max_kv_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -5338,13 +5364,29 @@ class DeepseekSparseAttnMultiStepBackend:
             first.init_forward_metadata_replay_cuda_graph_from_precomputed(
                 bs=bs, precomputed=precomputed, forward_mode=ForwardMode.DECODE
             )
+            # One batched copy for every sibling's KPool buffers: each separate
+            # copy_ is its own graph node (~4 us at decode sizes).
+            kpool_copies = ([], [])
             for backend in self.attn_backends[1 : self.speculative_num_steps - 1]:
                 backend._copy_replay_metadata_from_sibling(
                     src_backend=first,
                     bs=bs,
                     precomputed=precomputed,
                     forward_mode=ForwardMode.DECODE,
+                    kpool_copies=kpool_copies,
                 )
+            if kpool_copies[0]:
+                from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+                # torch._foreach_copy_ is one copy per tensor on ROCm
+                pairs = list(zip(*kpool_copies))
+                fits = [d.ndim in (1, 2) and d.numel() <= 8192 for d, _ in pairs]
+                small = [p for p, f in zip(pairs, fits) if f]
+                rest = [p for p, f in zip(pairs, fits) if not f]
+                if not try_small_copy([d for d, _ in small], [s for _, s in small]):
+                    rest = pairs
+                for d, s in rest:
+                    d.copy_(s)
             return
 
         # Use multi-backend fused copy when we have 3 or more backends

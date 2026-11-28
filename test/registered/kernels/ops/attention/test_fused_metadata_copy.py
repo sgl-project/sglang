@@ -5,6 +5,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -124,7 +125,13 @@ def reference_copy_decode(src, dst, max_len):
     bs = src["cache_seqlens"].shape[0]
     dst["cache_seqlens"].copy_(src["cache_seqlens"])
     dst["cu_seqlens_k"][1:].copy_(src["cu_seqlens_k"][1:])
-    dst["page_table_1"][:, :max_len].copy_(src["page_indices"])
+    if is_hip():
+        # HIP copies each row's live prefix; the tail keeps its old values
+        for row, n in enumerate(src["cache_seqlens"].tolist()):
+            n = min(n, max_len)
+            dst["page_table_1"][row, :n].copy_(src["page_indices"][row, :n])
+    else:
+        dst["page_table_1"][:, :max_len].copy_(src["page_indices"])
     dst["dsa_cache_seqlens"].copy_(src["dsa_cache_seqlens"])
     dst["dsa_cu_seqlens_k"][1 : bs + 1].copy_(src["dsa_cu_seqlens_k"][1 : bs + 1])
 
