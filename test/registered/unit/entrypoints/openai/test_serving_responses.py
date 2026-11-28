@@ -18,6 +18,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Author, Conversation, Message, Role, ToolNamespaceConfig
+from pydantic import ValidationError
 from transformers.utils.chat_template_utils import _compile_jinja_template
 from utils import (
     MockTemplateManager,
@@ -1363,6 +1364,19 @@ class InputItemNormalizationTestCase(CustomTestCase):
             }
         )
         self.assertEqual(kept["content"], [{"type": "text", "text": "No screen."}])
+
+    def test_function_call_output_with_a_malformed_image_url_fails_validation(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [{"type": "image_url", "image_url": ["data:,"]}],
+            }
+        )
+
+        # Chat validation turns this into a 400; a crash here would be a 500.
+        with self.assertRaises(ValidationError):
+            ChatCompletionMessageGenericParam(**normalized)
 
     def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
         template = (

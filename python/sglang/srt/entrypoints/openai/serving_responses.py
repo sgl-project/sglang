@@ -1554,13 +1554,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         skipped_image = False
         for part in parts:
             part_type = part.get("type")
-            if part_type in _TOOL_OUTPUT_MEDIA_PART_TYPES:
-                media = cls._normalize_response_content_part_for_chat(part)
-                image_url = media.get("image_url") or {}
-                if media["type"] == "image_url" and not image_url.get("url"):
-                    skipped_image = True  # A file_id-only image has no URL to load.
-                    continue
-                chat_parts.append(media)
+            if part_type == "input_image" and not part.get("image_url"):
+                skipped_image = True  # A file_id-only image has no URL to load.
+            elif part_type in _TOOL_OUTPUT_MEDIA_PART_TYPES:
+                chat_parts.append(cls._normalize_response_content_part_for_chat(part))
             elif "text" in part:
                 chat_parts.append({"type": "text", "text": part["text"]})
         if skipped_image and not any(
