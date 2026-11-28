@@ -945,7 +945,7 @@ class MuseGlimmerForCausalLM(nn.Module):
 
 
 class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
-    """Vendor multimodal HF export: the MuseGlimmerForCausalLM decoder plus the image tower."""
+    """Vendor multimodal HF export: the MuseGlimmerForCausalLM decoder plus the vision tower."""
 
     # Only this class reads vendor-named checkpoints, so only it needs the mapper.
     hf_to_sglang_mapper = _VENDOR_TO_SGLANG
@@ -996,16 +996,26 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0)
-        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0).cpu()
+    def _encode_vision_features(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
         assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        assert grid_thw.dim() == 2, grid_thw.dim()
 
-        features = self.vision_tower(pixel_values, image_grid_thw)
+        features = self.vision_tower(pixel_values, grid_thw)
         features = self.vision_adapter(features)
         features, _ = self.vision_projection(features)
         return self.perception_emb_norm(features)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0).cpu()
+        return self._encode_vision_features(pixel_values, image_grid_thw)
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        video_grid_thw = torch.cat([item.video_grid_thw for item in items], dim=0).cpu()
+        return self._encode_vision_features(pixel_values, video_grid_thw)
 
     @torch.no_grad()
     def forward(

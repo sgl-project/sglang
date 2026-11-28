@@ -83,7 +83,7 @@ Muse Glimmer is a multimodal reasoning model. You can serve Muse Glimmer in four
     <tr>
       <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
       <td style={{padding: "9px 12px"}}><code>meta-models/Muse-Glimmer-30B</code></td>
-      <td style={{padding: "9px 12px"}}>Supports image input.</td>
+      <td style={{padding: "9px 12px"}}>Supports image and video input.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><strong>GGUF Q4_K_M</strong></td>
@@ -156,11 +156,11 @@ Muse Glimmer enables the `muse` tool-call parser by default. This parser sends s
 
 ### 3.3 Multimodal
 
-The BF16 checkpoint supports image input. It defaults to text only. To switch, select **Modality** in the command panel above.
+The BF16 checkpoint supports image and video input. It defaults to text only. To switch, select **Modality** in the command panel above.
 
-**Text only** adds `--language-model-only`. This flag turns off the vision tower. SGLang does not build or load the vision weights. This frees memory for the KV cache. SGLang rejects image requests in this mode.
+**Text only** adds `--language-model-only`. This flag turns off the vision tower. SGLang does not build or load the vision weights. This frees memory for the KV cache. SGLang rejects image and video requests in this mode.
 
-Select **Image + text** to turn on image input.
+Select **Image + text** to enable the vision tower for image and video input.
 
 NVFP4, GGUF, and the MLX artifacts are text only. The Modality option does not appear for GGUF or MLX; NVFP4 only offers **Text only**.
 
