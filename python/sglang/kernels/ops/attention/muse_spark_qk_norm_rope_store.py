@@ -34,8 +34,8 @@ def _qk_rms_norm_fwd_kernel(
     K_OUT,  # [T, NUM_KV_HEADS * D]
     POS,  # [T] positions; only read when HAS_ROPE
     COS_SIN,  # [max_pos, D] fp32, cos then sin halves; only read when HAS_ROPE
-    K_CACHE,  # [N, NUM_KV_HEADS * D] BF16/FP8 pool; written when HAS_KV_STORE
-    V_CACHE,  # [N, NUM_KV_HEADS * D]
+    K_CACHE,  # [N, NUM_KV_HEADS * D] BF16/FP8 pool, or HND pages; written when HAS_KV_STORE
+    V_CACHE,  # same layout as K_CACHE
     CACHE_LOC,  # [T] pool row per token
     eps,
     stride_qkv,  # row stride of QKV, in elements
@@ -49,6 +49,7 @@ def _qk_rms_norm_fwd_kernel(
     HAS_ROPE: tl.constexpr,
     HAS_KV_STORE: tl.constexpr,
     FP8_KV_STORE: tl.constexpr,
+    PAGE: tl.constexpr = 1,  # HND page size; 1 = slot rows
     USE_PDL: tl.constexpr = False,
     FP8_MAX: tl.constexpr = FP8_E4M3_MAX,
 ):
@@ -112,7 +113,12 @@ def _qk_rms_norm_fwd_kernel(
         # Slot zero is reserved for CUDA-graph padding.
         kv_mask = mask & (loc != 0)[:, None]
         kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
-        kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D
+        # HND: [page, head, offset, D]; PAGE == 1 is the slot-row layout.
+        kv_dst = (
+            (loc // PAGE) * (NUM_KV_HEADS * PAGE * D)
+            + kv_head * (PAGE * D)
+            + (loc % PAGE) * D
+        )
         tl.store(
             K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None]
         )
@@ -206,8 +212,9 @@ class FusedQKNorm(BaseFusedOp):
         Rewrites ``normed[0]`` to FP8 for an FP8 pool, as the kernel does.
         """
         k_cache, v_cache, cache_loc = kv_store
+        page = k_cache.shape[2] if k_cache.dim() == 4 else 1
         slots = cache_loc[: qkv.shape[0]].long()
-        if torch.any((slots < 0) | (slots >= k_cache.shape[0])):
+        if torch.any((slots < 0) | (slots >= k_cache.shape[0] * page)):
             raise ValueError("KV cache slot out of bounds")
         # Slot zero is reserved for CUDA-graph padding.
         live = slots != 0
@@ -218,8 +225,12 @@ class FusedQKNorm(BaseFusedOp):
                 value = value.float().clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
             return value.to(k_cache.dtype)
 
-        k_cache[slots[live]] = cast(normed[1][live])
-        v_cache[slots[live]] = cast(self._v_slice(qkv)[live])
+        # HND pages [pages, heads, page, D]; slot rows are pages of one slot.
+        pages = (-1, self._num_kv_heads, page, self._head_dim)
+        heads = (-1, self._num_kv_heads, self._head_dim)
+        p, o = slots[live] // page, slots[live] % page
+        k_cache.view(pages)[p, :, o] = cast(normed[1][live]).view(heads)
+        v_cache.view(pages)[p, :, o] = cast(self._v_slice(qkv)[live]).view(heads)
         if fp8:
             normed[0] = cast(normed[0])
 
@@ -286,15 +297,21 @@ class FusedQKNorm(BaseFusedOp):
             return True
         if not (qkv.dim() == 2 and qkv.numel() > 0 and qkv.stride(-1) == 1):
             return False
-        if kv_store is not None and not (
-            kv_store[0].dtype in (qkv.dtype, torch.float8_e4m3fn)
-            and kv_store[0].dim() == 2
-            and kv_store[0].shape[1] == self._num_kv_heads * self._head_dim
-            and kv_store[1].shape == kv_store[0].shape
-            and kv_store[1].dtype == kv_store[0].dtype
-            and kv_store[2].shape[0] >= tokens_of(qkv)
-        ):
-            return False
+        if kv_store is not None:
+            # This store takes slot rows or HND pages [pages, heads, page, D].
+            cache, heads, dim = kv_store[0], self._num_kv_heads, self._head_dim
+            is_slot_rows = cache.dim() == 2 and cache.shape[1] == heads * dim
+            is_hnd = (
+                cache.dim() == 4 and cache.shape[1] == heads and cache.shape[3] == dim
+            )
+            if not (
+                cache.dtype in (qkv.dtype, torch.float8_e4m3fn)
+                and (is_slot_rows or is_hnd)
+                and kv_store[1].shape == cache.shape
+                and kv_store[1].dtype == cache.dtype
+                and kv_store[2].shape[0] >= tokens_of(qkv)
+            ):
+                return False
         return positions is None or (
             cos_sin_cache.dtype == torch.float32
             and cos_sin_cache.shape[-1] == self._head_dim
@@ -343,6 +360,7 @@ class FusedQKNorm(BaseFusedOp):
             k_cache, v_cache, cache_loc = kv_store
             assert k_cache.is_contiguous() and v_cache.is_contiguous()
             cache_loc = cache_loc.contiguous()
+            page = k_cache.shape[2] if k_cache.dim() == 4 else 1
         _qk_rms_norm_fwd_kernel[(triton.cdiv(n_rows, block_m),)](
             qkv,
             q_out,
@@ -355,7 +373,7 @@ class FusedQKNorm(BaseFusedOp):
             self._eps,
             qkv.stride(0),
             n_rows,
-            k_cache.shape[0] if has_kv else 0,
+            k_cache.shape[0] * page if has_kv else 0,
             self._num_q_heads,
             self._num_kv_heads,
             d,
@@ -364,6 +382,7 @@ class FusedQKNorm(BaseFusedOp):
             HAS_ROPE=has_rope,
             HAS_KV_STORE=has_kv,
             FP8_KV_STORE=fp8_kv,
+            PAGE=page if has_kv else 1,
             num_warps=num_warps,
             **pdl,
         )
@@ -380,7 +399,10 @@ class FusedQKNorm(BaseFusedOp):
 
         return (
             helion_supported(qkv)
-            and (kv_store is None or kv_store[0].dtype == qkv.dtype)
+            and (
+                kv_store is None
+                or (kv_store[0].dtype == qkv.dtype and kv_store[0].dim() == 2)
+            )
             and qkv.shape[0] > 0
             and qkv.dtype == torch.bfloat16
             and qkv.dim() == 2

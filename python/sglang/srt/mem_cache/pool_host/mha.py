@@ -37,6 +37,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyBufferInfo,
     IndexKeyLayout,
+    KVBufferLayout,
     KVScaleLayout,
     MHABufferInfo,
 )
@@ -139,6 +140,14 @@ def prepare_mha_write_back_staging(
     return staging
 
 
+def _transfer_rows(buffer: torch.Tensor, info: MHABufferInfo) -> torch.Tensor:
+    """HiCache moves whole pages, so an HND page [heads, page_size, dim] moves as
+    page_size rows of heads * dim, keeping the device byte order."""
+    if info.buffers.layout != KVBufferLayout.HND:
+        return buffer
+    return buffer.view(-1, buffer.shape[1], buffer.shape[3])
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
@@ -178,6 +187,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                     f"KV scale layout {info.scales.layout.value!r}."
                 )
             info.validate()
+            # HND moves whole pages (see _transfer_rows); page_head and
+            # page_unified split host pages by head, HiSparse moves single tokens.
+            if info.buffers.layout == KVBufferLayout.HND and (
+                layout in ("page_head", "page_unified")
+                or isinstance(self, HiSparseHostPoolMixin)
+            ):
+                raise ValueError(
+                    f"{pool_label}: HiCache layout {layout!r} does not support "
+                    "the HND KV layout (SGLANG_USE_HND_KVCACHE)."
+                )
             if info.transfer_buffers is None and (
                 info.buffers.k_data_ptrs is None or info.buffers.v_data_ptrs is None
             ):
@@ -234,8 +253,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
         )
-        self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
-        self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)
+        # HND host pages hold device page bytes: key them apart from NHD in L3.
+        if buffer_info.buffers.layout == KVBufferLayout.HND:
+            self.storage_format_tag = "hnd"
+        self.device_k_buffers = tuple(
+            _transfer_rows(b, info) for info in infos for b in info.buffers.k
+        )
+        self.device_v_buffers = tuple(
+            _transfer_rows(b, info) for info in infos for b in info.buffers.v
+        )
         if buffer_info.transfer_buffers is None:
             self.device_k_data_ptrs = (
                 torch.cat([info.buffers.k_data_ptrs for info in infos])

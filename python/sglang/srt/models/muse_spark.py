@@ -398,6 +398,9 @@ class MuseSpark1xAttention(nn.Module):
         cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
         k_cache = pool.layer_router.read(self.layer_idx).key()
         v_cache = pool.layer_router.read(self.layer_idx).value()
+        if k_cache.dim() == 4:
+            # HND pages [pages, heads, page, D]; the store addresses them as-is.
+            return k_cache, v_cache, cache_loc
         return (
             k_cache.view(k_cache.shape[0], -1),
             v_cache.view(v_cache.shape[0], -1),

@@ -42,7 +42,10 @@ def fused_fp8_qkv_kv_cache(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | None:
-    """Fused FP8 quant of K/V (+ optional Q) + paged KV-cache write."""
+    """Fused FP8 quant of K/V (+ optional Q) + paged KV-cache write.
+
+    ``k_cache``/``v_cache`` are slot rows, or HND pages [pages, heads, page_size, head_dim].
+    """
     if k.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {k.dtype}. Supported: bfloat16, float16")
 
@@ -51,6 +54,8 @@ def fused_fp8_qkv_kv_cache(
     v2 = v.reshape(num_tokens, -1)
     kv_dim = k2.shape[1]
 
+    # HND pages [pages, heads, page_size, head_dim], or slot rows.
+    page_size, head_dim = k_cache.shape[2:] if k_cache.dim() == 4 else (1, kv_dim)
     k_cache2 = k_cache.view(-1, kv_dim)
     v_cache2 = v_cache.view(-1, kv_dim)
 
@@ -65,6 +70,6 @@ def fused_fp8_qkv_kv_cache(
 
     module = _jit_fused_fp8_qkv_kv_cache_module(k.dtype, is_arch_support_pdl())
     module.fused_fp8_qkv_kv_cache(
-        q2, k2, v2, q_out, k_cache2, v_cache2, cache_loc, ks, vs
+        q2, k2, v2, q_out, k_cache2, v_cache2, cache_loc, ks, vs, page_size, head_dim
     )
     return q_out
