@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -373,6 +374,11 @@ class TestTransferFramesAndHistory(unittest.TestCase):
     def test_missing_video_has_no_fps(self):
         self.assertIsNone(read_video_fps("/nonexistent/control.mp4"))
 
+    def test_url_is_never_probed_for_fps(self):
+        with mock.patch("imageio.v3.immeta") as immeta:
+            self.assertIsNone(read_video_fps("https://example.com/control.mp4"))
+        immeta.assert_not_called()
+
     def test_synthetic_control_matches_warmup_request(self):
         frames = synthetic_control_frames(num_frames=17, height=480, width=832)
         self.assertEqual(tuple(frames.shape), (3, 17, 480, 832))
@@ -418,6 +424,33 @@ class TestTransferFramesAndHistory(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "truncated file"):
                 decode.wait(2)
             decode.close()
+
+    @_fails_if_hung
+    def test_a_url_clip_is_fetched_once_and_its_copy_lasts_until_close(self):
+        url = "https://example.com/control.mp4"
+        events = []
+
+        @contextmanager
+        def fetched(video):
+            events.append(("fetch", video))
+            yield "/staged/video.mp4"
+            events.append(("release", video))
+
+        def frames(path, max_frames):
+            events.append(("decode", path))
+            yield torch.zeros((4, 6, 3), dtype=torch.uint8).numpy()
+
+        with (
+            mock.patch.object(control_clip, "local_video_path", fetched),
+            mock.patch.object(control_clip, "iter_video_frames", frames),
+        ):
+            decode = ControlClipDecode(url, max_frames=5)
+            self.assertEqual(decode.wait(), 1)
+            # The decode has ended and the copy is still there for the frame-rate probe.
+            self.assertEqual(decode.local_path, "/staged/video.mp4")
+            self.assertEqual(events, [("fetch", url), ("decode", "/staged/video.mp4")])
+            decode.close()
+        self.assertEqual(events[2:], [("release", url)])
 
     def test_the_control_encode_streams_only_with_the_vae_feature_cache(self):
         vae = SimpleNamespace(use_feature_cache=True)

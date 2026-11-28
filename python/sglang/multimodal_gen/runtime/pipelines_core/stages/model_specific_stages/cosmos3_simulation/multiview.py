@@ -209,15 +209,20 @@ def media_hw(path: str) -> tuple[int, int]:
     try:
         import av
 
-        with av.open(path) as container:
+        # A local file is probed as bytes; a URL fails to open here and is
+        # downloaded by load_video under the media URL policy.
+        with (
+            open(path, "rb") as source,
+            av.open(source, options={"protocol_whitelist": "data"}) as container,
+        ):
             stream = container.streams.video[0]
             if stream.height and stream.width:
                 return int(stream.height), int(stream.width)
-    except Exception:  # PyAV missing or metadata unreadable: decode instead.
+    except Exception:  # PyAV missing, not a local file, or metadata unreadable.
         pass
     decoded = load_video(path, max_frames=1)
     if not decoded:
-        raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
+        raise ValueError("No frames decoded from Cosmos3 multiview media.")
     first = decoded[0]
     return int(first.height), int(first.width)
 
@@ -246,7 +251,7 @@ def load_media_uint8_cthw(
         frames, max_frames=max_frames, height=height, width=width, out=out
     )
     if fitted.shape[1] == 0:
-        raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
+        raise ValueError("No frames decoded from Cosmos3 multiview media.")
     return fitted
 
 

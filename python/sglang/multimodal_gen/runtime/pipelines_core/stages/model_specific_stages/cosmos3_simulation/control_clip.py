@@ -6,13 +6,14 @@ copied once and a reader can take the early ones while the later ones decode.
 """
 
 import threading
-from contextlib import closing
+from contextlib import ExitStack, closing
 
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RequestResource
 from sglang.multimodal_gen.runtime.utils.vision import (
     iter_video_frames,
+    local_video_path,
     rgb_hwc_uint8,
 )
 
@@ -26,7 +27,8 @@ class ControlClipDecode(RequestResource):
     """A control clip decoding on a thread into one ``uint8 [T, H, W, 3]`` buffer.
 
     Frames become final in order, and ``frames`` may read any frame that ``wait``
-    has reported, also after ``close``.
+    has reported, also after ``close``. ``local_path`` is the clip as a file until
+    ``close``: a URL is fetched once, under the media URL policy.
     """
 
     def __init__(self, path: str, *, max_frames: int) -> None:
@@ -34,6 +36,8 @@ class ControlClipDecode(RequestResource):
             raise ValueError(f"max_frames must be positive, got {max_frames}.")
         self.path = path
         self.max_frames = max_frames
+        self._staged = ExitStack()
+        self.local_path = self._staged.enter_context(local_video_path(path))
         self._changed = threading.Condition()
         self._buffer: torch.Tensor | None = None
         self._decoded = 0
@@ -61,7 +65,7 @@ class ControlClipDecode(RequestResource):
     @property
     def source_hw(self) -> tuple[int, int]:
         if self.wait(1) == 0:
-            raise ValueError(f"No frames decoded from control video {self.path!r}.")
+            raise ValueError("No frames decoded from control video.")
         frame = self.frames(0, 1)
         return int(frame.shape[2]), int(frame.shape[3])
 
@@ -73,11 +77,12 @@ class ControlClipDecode(RequestResource):
         with self._changed:
             self._closed = True
         self._thread.join()
+        self._staged.close()
 
     def _decode(self) -> None:
         try:
             with closing(
-                iter_video_frames(self.path, max_frames=self.max_frames)
+                iter_video_frames(self.local_path, max_frames=self.max_frames)
             ) as decoded_frames:
                 for index, frame in enumerate(decoded_frames):
                     pixels = rgb_hwc_uint8(frame)

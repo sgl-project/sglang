@@ -13,6 +13,7 @@ paired control/RGB window with pinned sink frames.
 
 import json
 import math
+import os
 from collections.abc import Callable, Iterator
 from functools import partial
 from itertools import count
@@ -193,7 +194,13 @@ def format_transfer_prompt(
 
 
 def read_video_fps(path: str) -> float | None:
-    """Frame rate from the container metadata, or None when the backend has none."""
+    """Frame rate from the container metadata of a local file, or None.
+
+    A URL is never opened here: the caller fetches it under the media URL
+    policy and passes the local copy.
+    """
+    if not os.path.isfile(path):
+        return None
     try:
         fps = iio.immeta(path).get("fps")
     except (OSError, ValueError, RuntimeError, KeyError):
@@ -545,13 +552,13 @@ class CosmosDreamsControlVideoStage(PipelineStage):
         result.add_check("num_frames", batch.num_frames, V.positive_int)
         return result
 
-    def _resolve_fps(self, batch: Req, control_path: str) -> float:
+    def _resolve_fps(self, batch: Req, local_path: str) -> float:
         if batch.sampling_params.is_explicit("fps"):
             return float(batch.fps)
-        fps = read_video_fps(control_path)
+        fps = read_video_fps(local_path)
         if fps is None:
             raise ValueError(
-                f"Could not read the frame rate of {control_path!r}; pass fps explicitly."
+                "Could not read the frame rate of the control video; pass fps explicitly."
             )
         return fps
 
@@ -583,10 +590,11 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             max_frames=min(int(sampling_params.max_frames), int(batch.num_frames)),
         )
         try:
-            return decode, hint, self._resolve_fps(batch, control_path), control_path
+            fps = self._resolve_fps(batch, decode.local_path)
         except BaseException:
             decode.close()
             raise
+        return decode, hint, fps, control_path
 
     def _resolve_canvas(
         self, batch: Req, *, hint: str, source_hw: tuple[int, int]

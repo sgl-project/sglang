@@ -102,6 +102,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     load_video,
+    open_video_source,
     preprocess_image,
 )
 from sglang.srt.environ import envs
@@ -256,9 +257,12 @@ def _iter_video_frames_pyav(
     if keep not in ("first", "last"):
         raise ValueError("keep must be 'first' or 'last'")
 
-    with av.open(video_path) as container:
+    with (
+        open_video_source(video_path) as source,
+        av.open(source, options={"protocol_whitelist": "data"}) as container,
+    ):
         if not container.streams.video:
-            raise ValueError(f"No video stream in {video_path!r}")
+            raise ValueError("Input media has no video stream.")
         stream = container.streams.video[0]
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
@@ -341,7 +345,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path, max_frames=max_frames)
         if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+            raise ValueError("No frames decoded from transfer video.")
         frames = frames[:max_frames]
         frames_cthw = torch.stack(
             [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
@@ -571,7 +575,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 else:
                     processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
             if not processed:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+                raise ValueError("No frames decoded from input video.")
             # Pad CUDA frames after conversion to the VAE dtype instead.
             if force_cpu:
                 if len(processed) < num_source_frames:
