@@ -272,6 +272,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     self._pp_apply_war_barrier()
 
+                self.profiler_manager.run_at_boundary()
                 # `self.last_batch` is the one reloaded for this micro-batch, so
                 # pass the batch this iteration launched.
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
@@ -403,6 +404,7 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
+                self.profiler_manager.run_at_boundary()
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
@@ -609,6 +611,7 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
+                self.profiler_manager.run_at_boundary()
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
@@ -873,7 +876,7 @@ class SchedulerPPMixin:
     ) -> None:
         with self.pp_comm_stream_ctx:
             for p2p_work in work:
-                p2p_work.work.wait()
+                p2p_work.wait()
         if fence_next_forward and work:
             # CUDA Graph outputs are views of replay-owned static buffers. Do not
             # replay the next forward until NCCL has stopped reading the previous

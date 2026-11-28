@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import warnings
 import weakref
 from collections import namedtuple
@@ -143,14 +144,67 @@ class GraphCaptureContext:
     stream: torch.Stream
 
 
-@dataclass
+@dataclass(eq=False)
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
+    waited: bool = False
 
-    def wait(self) -> None:
-        if self.work is not None:
-            self.work.wait()
+    def wait(self, timeout: Optional[timedelta] = None) -> None:
+        """Wait once: a gloo send waited again blocks until the group's timeout."""
+        if self.work is not None and not self.waited:
+            if timeout is None:
+                self.work.wait()
+            else:
+                self.work.wait(timeout)
+        self.waited = True
+
+
+# Async CPU-group sends of one thread since the torch profiler started, and that thread.
+_tracked_host_sends: Optional["weakref.WeakSet[P2PWork]"] = None
+_tracking_thread: Optional[int] = None
+
+
+def host_send(work: torch.distributed.Work, payload: torch.Tensor) -> P2PWork:
+    """Wrap an async CPU-group (gloo) send; tracked for ``wait_host_sends`` while a
+    torch profiler runs."""
+    p2p_work = P2PWork(work, payload)
+    if _tracked_host_sends is not None and threading.get_ident() == _tracking_thread:
+        _tracked_host_sends.add(p2p_work)
+    return p2p_work
+
+
+def track_host_sends() -> None:
+    """Call right after the torch profiler starts, on the thread that stops it."""
+    global _tracked_host_sends, _tracking_thread
+    _tracked_host_sends = weakref.WeakSet()
+    _tracking_thread = threading.get_ident()
+
+
+def wait_host_sends(timeout: timedelta) -> None:
+    """Call right before the torch profiler stops: wait each tracked send nobody has
+    waited yet. A gloo send started under the profiler ends its RecordFunction in
+    ``wait()``, and after ``stop()`` that write lands in freed host memory.
+
+    Every receiver must be able to post its receive without this rank's further
+    progress (PP loops stop at an iteration boundary). A send its peer does not
+    receive within ``timeout`` raises; gloo then closes that connection."""
+    global _tracked_host_sends, _tracking_thread
+    tracked, _tracked_host_sends, _tracking_thread = _tracked_host_sends, None, None
+    pending = [w for w in tracked or () if not w.waited]
+    try:
+        for p2p_work in pending:
+            p2p_work.wait(timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Stopping the torch profiler: {len(pending)} async CPU-group sends of "
+            f"this PP stage were not received within {timeout}; the receiving "
+            "stage is gone or stuck"
+        ) from exc
+    if pending:
+        logger.info(
+            "Waited %d PP host sends before stopping the profiler.", len(pending)
+        )
 
 
 def _split_tensor_dict(
@@ -1659,7 +1713,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(size_work, size_tensor))
+            p2p_work.append(host_send(size_work, size_tensor))
 
         object_work = send_func(
             object_tensor,
@@ -1668,7 +1722,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(object_work, object_tensor))
+            p2p_work.append(host_send(object_work, object_tensor))
 
         return p2p_work
 
@@ -1843,7 +1897,9 @@ class GroupCoordinator:
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+                p2p_works.append(
+                    host_send(work, tensor) if tensor.is_cpu else P2PWork(work, tensor)
+                )
         return p2p_works
 
     def recv_tensor_dict(

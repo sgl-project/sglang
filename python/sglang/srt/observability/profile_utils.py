@@ -3,11 +3,13 @@ import os
 import time
 from abc import ABC
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state import track_host_sends, wait_host_sends
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -155,15 +157,18 @@ class ProfileManager:
 
     def _do_stop(self):
         logger.info("Stop profiling...")
-        self.profiler.stop()
+        # Cleared first, so a stop that raises (a PP peer gone) leaves no capture.
+        profiler, self.profiler = self.profiler, None
+        try:
+            profiler.stop()
+        finally:
+            # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
+            # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
+            # this guarantees the flag resets on every stop path.
+            set_detailed_annotations_enabled(False)
         logger.info(
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
-        self.profiler = None
-        # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
-        # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
-        # this guarantees the flag resets on every stop path.
-        set_detailed_annotations_enabled(False)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -339,10 +344,12 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             ),
         )
         self.torch_profiler.start()
+        track_host_sends()
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
+        wait_host_sends(timedelta(seconds=get_device().watchdog_timeout))
         if _is_npu:
             NPUTraceHandler.stop_capture(self.torch_profiler)
         else:

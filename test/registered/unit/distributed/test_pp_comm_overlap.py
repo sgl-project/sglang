@@ -7,7 +7,11 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
-from sglang.srt.distributed.parallel_state import GroupCoordinator, _split_tensor_dict
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    P2PWork,
+    _split_tensor_dict,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
 from sglang.srt.managers import utils as managers_utils
@@ -58,7 +62,7 @@ class TestPPCommOverlap(CustomTestCase):
     def test_graph_proxy_send_records_forward_reuse_fence(self):
         comm_stream = FakeStream(4)
         work = Mock()
-        works = [SimpleNamespace(work=work)]
+        works = [P2PWork(work=work, payload=None)]
         scheduler = _make_scheduler(
             pp_comm_stream=comm_stream,
             pp_comm_stream_ctx=nullcontext(),
@@ -79,7 +83,7 @@ class TestPPCommOverlap(CustomTestCase):
             pp_send_done_event=None,
         )
 
-        scheduler._pp_commit_comm_work([SimpleNamespace(work=Mock())], True)
+        scheduler._pp_commit_comm_work([P2PWork(work=Mock(), payload=None)], True)
 
         self.assertIsNone(scheduler.pp_send_done_event)
 

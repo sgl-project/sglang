@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -16,6 +17,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.distributed.parallel_state import track_host_sends, wait_host_sends
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
@@ -54,6 +56,10 @@ class SchedulerProfilerManager:
 
     def __post_init__(self) -> None:
         self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
+        # PP loops run the step predicate at the end of each iteration
+        # (run_at_boundary), where a stop may wait the stage's sends.
+        self.at_boundary = get_parallel().pp_size > 1
+        self._boundary_batch: Optional[ScheduleBatch] = None
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 cpu_group=self.dp_tp_cpu_group,
@@ -262,6 +268,7 @@ class SchedulerProfilerManager:
             except RuntimeError as e:
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
+            track_host_sends()
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -333,6 +340,14 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
+            try:
+                # The same bound the scheduler watchdog puts on a stuck batch.
+                wait_host_sends(timedelta(seconds=get_device().watchdog_timeout))
+            except RuntimeError:
+                # The profiler cannot stop safely; let the error surface once.
+                self.torch_profiler = None
+                self.profile_in_progress = False
+                raise
             if _is_npu:
                 NPUTraceHandler.stop_capture(self.torch_profiler)
             else:
@@ -408,6 +423,20 @@ class SchedulerProfilerManager:
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
+        if self.at_boundary:
+            self._boundary_batch = batch
+            return
+        self._run_profile_predicate(batch)
+
+    def run_at_boundary(self) -> None:
+        """Run the step predicate of the batch this PP loop iteration launched, if any.
+        Every send of the iteration is out, so a stop may wait them (wait_host_sends);
+        a capture the predicate starts here covers the stage's next batch onward."""
+        batch, self._boundary_batch = self._boundary_batch, None
+        if batch is not None:
+            self._run_profile_predicate(batch)
+
+    def _run_profile_predicate(self, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return

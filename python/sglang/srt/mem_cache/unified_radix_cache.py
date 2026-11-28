@@ -27,6 +27,7 @@ import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.parallel_state import P2PWork, host_send
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -376,7 +377,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Rounds of PP-sync sends to keep un-waited: the PP loop's own run-ahead,
         # since a gloo send only completes once the next rank posts its recv.
         self.pp_sync_window = max(1, params.pp_size + params.pp_async_batch_depth)
-        self.work_rounds: deque[list[torch.distributed.Work]] = deque([[]])
+        self.work_rounds: deque[list[P2PWork]] = deque([[]])
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -481,7 +482,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
-            self.work_rounds[-1].append(send_work)
+            self.work_rounds[-1].append(host_send(send_work, copy_of_data))
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
