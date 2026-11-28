@@ -124,15 +124,18 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         alpha: Optional[float] = None,
         limit: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
+        fused_limit: bool = False,
     ):
         self.need_quant = need_quant
         self.alpha = alpha
         self.limit = limit
         self.swiglu_limit = swiglu_limit
+        # False keeps the eager clip-before-SiLU path; the fused kernel clamps
+        # as min(silu(gate), limit) instead.
+        self.fused_limit = fused_limit
         self._use_oai = alpha is not None and limit is not None
         if swiglu_limit is not None:
             assert need_quant and not self._use_oai
-            return
         if self._use_oai:
             from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
@@ -148,7 +151,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        if self.swiglu_limit is not None:
+        if self.swiglu_limit is not None and not self.fused_limit:
             return _clipped_swiglu_quant(
                 hidden_states, self.swiglu_limit, group_list, group_list_type
             )
@@ -162,8 +165,17 @@ class NPUSwigluDeepEPKernel(BaseActivation):
                 group_list_type=group_list_type,
             )
         else:
+            limit_kwargs = (
+                {"do_limit": True, "limit": float(self.swiglu_limit)}
+                if self.swiglu_limit is not None
+                else {}
+            )
             hidden_states, per_token_scale = self._kernel(
-                hidden_states, group_list, group_list_type, need_quant=self.need_quant
+                hidden_states,
+                group_list,
+                group_list_type,
+                need_quant=self.need_quant,
+                **limit_kwargs,
             )
         if self.need_quant:
             return hidden_states, per_token_scale

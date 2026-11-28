@@ -38,7 +38,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW8A8Int8MoEMethod,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, process_model_config
 
 
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
@@ -212,6 +212,9 @@ class AscendRunnerCore(MoeRunnerCore):
                     alpha=config.gemm1_alpha,
                     limit=config.gemm1_clamp_limit,
                     swiglu_limit=swiglu_limit,
+                    # DSV4 only: clamps as min(silu(g), limit), not clip-before-SiLU.
+                    fused_limit=swiglu_limit is not None
+                    and process_model_config().hf_config.model_type == "deepseek_v4",
                 )
         else:
             # Non-DeepEP, no-A2A routing path
