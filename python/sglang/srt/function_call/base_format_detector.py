@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -30,6 +31,17 @@ logger = logging.getLogger(__name__)
 
 # A call takes a few steps; the bound only stops a detector that never idles.
 _MAX_STEPS_PER_CHUNK = 1024
+
+
+def _xgrammar_supports_token_markers() -> bool:
+    """Whether the installed xgrammar accepts ``token_markers`` (>= 0.2.9)."""
+    if get_model_structural_tag is None:
+        return False
+    try:
+        params = inspect.signature(get_model_structural_tag).parameters
+    except (TypeError, ValueError):
+        return False
+    return "token_markers" in params
 
 
 class BaseFormatDetector(ABC):
@@ -437,6 +449,17 @@ class BaseFormatDetector(ABC):
         """Return the XGrammar model name for native structural tags, if supported."""
         return None
 
+    def use_structural_tag_token_markers(self) -> bool:
+        """Whether XGrammar should match this format's control markers as tokens.
+
+        With token markers a tool call starts on the marker token (e.g.
+        ``<tool_call>``) rather than on a literal text trigger, so whitespace
+        variants after the marker cannot escape the constraint. Only return
+        True when every marker XGrammar declares for the format is a single
+        token in the served tokenizer.
+        """
+        return False
+
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
@@ -472,12 +495,19 @@ class BaseFormatDetector(ABC):
             if isinstance(tool_choice, ToolChoice)
             else tool_choice
         )
+        kwargs = {}
+        if (
+            self.use_structural_tag_token_markers()
+            and _xgrammar_supports_token_markers()
+        ):
+            kwargs["token_markers"] = True
         return get_model_structural_tag(
             model=structural_tag_name,
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+            **kwargs,
         )
 
     def get_auto_tool_call_structural_tag(
