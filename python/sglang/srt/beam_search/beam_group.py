@@ -24,7 +24,8 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from typing import List, Optional, Sequence
+import weakref
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -32,6 +33,9 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class BeamGroupState(enum.Enum):
@@ -104,7 +108,7 @@ class BeamGroup:
 
         # Scheduler wiring, filled in from outside the search core. Members have
         # no Req, so their seq len and KV lengths are implied by the leader's.
-        self.leader = None
+        self._leader: Optional[weakref.ref] = None
         # Device [k-1] member row indices, and the same rows on host (for
         # row-slot free). None until the post-prefill spawn / after free.
         self.member_rows: Optional[torch.Tensor] = None
@@ -117,6 +121,16 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
+
+    @property
+    def leader(self) -> Optional[Req]:
+        """Held weakly: the Req owns its group, and a strong back-reference would
+        make finished requests cyclic garbage."""
+        return None if self._leader is None else self._leader()
+
+    @leader.setter
+    def leader(self, req: Optional[Req]) -> None:
+        self._leader = None if req is None else weakref.ref(req)
 
     @property
     def num_member_rows(self) -> int:

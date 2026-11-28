@@ -922,7 +922,7 @@ class TestTriFactorySizing(_PoolTestCase):
     def test_mamba_lazy_checkpoint_cleanup(self):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_parallel, get_schedule
 
         for tri_pool in (False, True):
             for lazy in (False, True):
@@ -989,6 +989,7 @@ class TestTriFactorySizing(_PoolTestCase):
                         # either top-level flag forwarding must break cleanup.
                         with (
                             get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+                            get_schedule().override(page_size=1),
                             patch.object(
                                 cfg,
                                 "get_exec",
