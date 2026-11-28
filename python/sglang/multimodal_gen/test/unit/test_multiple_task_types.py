@@ -76,6 +76,13 @@ def test_legacy_enums_and_capabilities():
         assert config.resolve_task_type(task.name.lower()) == task
 
 
+def test_video_output_tasks_declare_video_gen():
+    """A task producing VIDEO must pass is_video_gen(), or visual adjustment is
+    skipped for it and served output keeps an extensionless file name."""
+    for task in Task:
+        assert task.is_video_gen() is (task.data_type() is DataType.VIDEO)
+
+
 @pytest.mark.parametrize("declared", [(), (Task.T2I,), (Task.T2V, Task.T2V)])
 def test_invalid_capability_declarations(declared):
     class Invalid(MultiConfig):
@@ -354,6 +361,41 @@ def test_video_transports_keep_selected_task(http_client, multipart):
     indirect=True,
 )
 @pytest.mark.parametrize("multipart", [False, True])
+def test_wan_s2v_video_request_admits_audio_and_names_mp4(http_client, multipart):
+    """An S2V model declares no audio field, so the endpoint drops audio_path and
+    rejects every request; S2V outside is_video_gen() also loses the extension."""
+    client, admitted, _ = http_client
+    payload = {"prompt": "a woman sings", "size": "1024x704"}
+    if multipart:
+        # The form field is typed UploadFile, so the reference travels as bytes.
+        response = client.post(
+            "/v1/videos",
+            data={**payload, "audio_path": "/tmp/talk.wav"},
+            files={"input_reference": ("ref.png", png_bytes(), "image/png")},
+        )
+    else:
+        response = client.post(
+            "/v1/videos",
+            json={
+                **payload,
+                "input_reference": "/tmp/ref.png",
+                "audio_path": "/tmp/talk.wav",
+            },
+        )
+    assert response.status_code == 200, response.text
+    params = admitted[-1].sampling_params
+    assert params.task_type == Task.S2V
+    assert params.image_path is not None
+    assert params.audio_path == "/tmp/talk.wav"
+    assert params.output_file_name.endswith(".mp4")
+
+
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize("multipart", [False, True])
 def test_wan_s2v_rejects_cache_flags_it_would_ignore(
     http_client, multipart, monkeypatch
 ):
@@ -389,6 +431,45 @@ def test_wan_s2v_rejects_cache_flags_it_would_ignore(
     # Spectrum is not an HTTP field; it reaches the same check from the CLI/Python API.
     with pytest.raises(ValueError, match="enable_spectrum"):
         Wan2_2_S2V_14B_SamplingParam(enable_spectrum=True)
+
+
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "fields, requested_frames",
+    [
+        ({}, 64),
+        ({"seconds": 5}, 80),
+        ({"fps": 24}, 64),
+        ({"num_frames": 81}, 81),
+        ({"fps": 24, "num_frames": 81}, 81),
+    ],
+    ids=["none", "seconds", "fps", "num_frames", "fps_num_frames"],
+)
+def test_wan_s2v_video_defaults_use_model_fps(http_client, fields, requested_frames):
+    """S2V writes its video at 16 fps, so the API must not size an omitted
+    num_frames by its 24 fps default or a request fps."""
+    client, admitted, config = http_client
+    response = client.post(
+        "/v1/videos",
+        json={
+            "prompt": "a woman sings",
+            "size": "1024x704",
+            "input_reference": "/tmp/ref.png",
+            "audio_path": "/tmp/talk.wav",
+            **fields,
+        },
+    )
+    assert response.status_code == 200, response.text
+    params = admitted[-1].sampling_params
+    assert params.fps == 16
+    # Wan rounds num_frames to 4k + 1 after the hook (64 -> 65).
+    assert params.num_frames == config.adjust_num_frames(
+        requested_frames, log_adjustment=False
+    )
 
 
 def test_http_rejects_invalid_tasks_before_model_execution(http_client):

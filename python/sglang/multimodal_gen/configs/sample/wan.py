@@ -397,6 +397,33 @@ class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
             )
         super().__post_init__()
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        # The audio and pose inputs; each is a local path or an http(s) URL.
+        return frozenset({"audio_path", "pose_video_path"})
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls, request: Any, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        # The S2V pipeline writes the video at its own 16 fps, so the API's 24 fps
+        # default (or any request fps) would only change the frame count.
+        # Imported here: the openai utils module pulls in the server stack.
+        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+            DEFAULT_VIDEO_SECONDS,
+        )
+
+        kwargs = super().lower_video_request_kwargs(request, dict(kwargs))
+        kwargs["fps"] = cls.fps
+        if request.num_frames is None:
+            seconds = (
+                request.seconds
+                if request.seconds is not None
+                else DEFAULT_VIDEO_SECONDS
+            )
+            kwargs["num_frames"] = cls.fps * seconds
+        return kwargs
+
 
 @dataclass
 class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):
