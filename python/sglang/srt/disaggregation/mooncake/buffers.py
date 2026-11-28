@@ -18,6 +18,8 @@ class BufferKind(enum.IntEnum):
     STATE = 2
     # Staging rings and DCP pack buffers registered through register_fn.
     STAGING = 3
+    # Typed draft components use their own registration namespace.
+    DRAFT = 4
 
 
 class MooncakeBufferKey(BufferKey):

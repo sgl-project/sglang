@@ -2050,6 +2050,12 @@ def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if not algorithm.is_dflash_family():
         return {}
+    if spec.speculative_draft_pd_lane:
+        return {
+            "algorithm": algorithm.name,
+            "draft_lane_version": 1,
+            "context_encoder_tp": spec.speculative_prefill_context_tp_size,
+        }
     if not kv_args.num_draft_entries:
         return None
     # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.

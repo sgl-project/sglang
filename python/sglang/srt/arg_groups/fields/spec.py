@@ -41,6 +41,36 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_draft_kv_layout: A[
+        Literal["shared", "independent", "hybrid"],
+        Arg(
+            help="DFLASH experimental draft cache: shared target IDs (default), independent full slots, or independent native full/SWA slots. CUDA cohorts 2/4 keep the draft eager while allowing target verify CUDA graphs.",
+            choices=["shared", "independent", "hybrid"],
+        ),
+    ] = "shared"
+    speculative_draft_cohort_size: A[
+        int,
+        "Experimental DFLASH: number of target attention-DP owners sharing one draft TP group; fixed at startup.",
+    ] = 1
+    speculative_draft_cohort_cuda_graph: A[
+        bool,
+        "Experimental CUDA cohort2/4 draft-forward graphs; target decode graphs must be enabled. CPU PLAN/COMMIT, selector and B1 remain on their existing paths.",
+    ] = False
+    speculative_prefill_context_mode: A[
+        Literal["legacy", "full", "slim"],
+        Arg(
+            help="DFLASH PD prefill context role: legacy worker, full-weight reference encoder, or K/V-only slim encoder.",
+            choices=["legacy", "full", "slim"],
+        ),
+    ] = "legacy"
+    speculative_draft_pd_lane: A[
+        bool,
+        "Experimental synchronous DFLASH typed PD lane for independent full/window KV; supports TP2 context encoders with TP2 or TP4 decode head shards.",
+    ] = False
+    speculative_prefill_context_tp_size: A[
+        int,
+        "Tensor-parallel width of the PD context encoder, independent of target CP and DPA (experimental typed lane).",
+    ] = 1
     speculative_boundary_reduction: A[
         Literal["ar", "rs", "rsv", "rs+rsv"],
         Arg(no_cli=True, resolvable=True),

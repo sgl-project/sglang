@@ -735,9 +735,11 @@ class TpModelWorker(BaseTpWorker):
                     if not return_iteration_ids
                     # A folded forward also wrote the replay rows; the caller's
                     # plan covers the batch it scheduled.
-                    else forward_batch.iteration_ids
-                    if folded is None
-                    else self.model_runner.runner_ids.own_plan(batch)
+                    else (
+                        forward_batch.iteration_ids
+                        if folded is None
+                        else self.model_runner.runner_ids.own_plan(batch)
+                    )
                 ),
                 kv_weight_version_record=out.kv_weight_version_record,
             )
