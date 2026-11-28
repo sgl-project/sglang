@@ -698,6 +698,31 @@ set. The B200 diffusion CI job (`multimodal-gen-test-1-b200`) uses a
 representative NVFP4 subset and includes
 `lmsys/qwen-image-2512-modelopt-nvfp4-sglang` for Qwen Image coverage.
 
+## LightX2V Qwen-Image FP8 checkpoints
+
+You can load the native LightX2V Qwen-Image rowwise FP8 format without repacking.
+The loader detects E4M3 weights and BF16 per-output-channel scales of shape
+`[out_features, 1]` when the checkpoint has no quantization declaration. Existing
+quantization declarations take precedence. This does not cover every LightX2V
+or Qwen-Image FP8 export.
+
+For example, use the merged eight-step
+`qwen_image_2512_fp8_e4m3fn_scaled_8steps_v1.0.safetensors` checkpoint with the
+base model's text encoder, tokenizer, scheduler, and VAE:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen-Image-2512 \
+  --transformer-weights-path /path/to/qwen_image_2512_fp8_e4m3fn_scaled_8steps_v1.0.safetensors \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+Request eight inference steps for this checkpoint. Its Lightning adapter is
+already merged: do not apply the same LoRA again or add an online
+`--quantization fp8` override. The format uses the existing rowwise FP8 backend;
+the merged checkpoint was validated on NVIDIA H200.
+
 ## ModelOpt FP8
 
 ### Usage Examples
