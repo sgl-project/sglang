@@ -176,10 +176,10 @@ async fn edge_counters_recorded_through_middleware() {
         m.contains(r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 1"#),
         "edge intake counter missing; got:\n{m}",
     );
-    // response — counted on the way out by the middleware
+    // response — counted on the way out by the middleware, including model attribution
     assert!(
         m.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="tiny",status_code="200"} 1"#
         ),
         "edge response counter missing; got:\n{m}",
     );
@@ -384,7 +384,7 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
     );
     assert!(
         m.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="500"} 1"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="tiny",status_code="500"} 1"#
         ),
         "the 500 status must be counted; got:\n{m}",
     );
@@ -1368,7 +1368,7 @@ async fn streaming_mid_body_drop_stays_200_with_no_router_headers() {
     let m = ctx.metrics.render();
     assert!(
         m.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="tiny",status_code="200"} 1"#
         ),
         "a streaming mid-drop counts as a 200 at the edge: {m}",
     );
@@ -1950,7 +1950,7 @@ async fn streaming_error_event_records_outcome_without_tripping_breaker() {
     let (ctx, metrics) = stream_chat_and_render(&worker.url, &expected).await;
     assert!(has_metric_line(
         &metrics,
-        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="tiny",status_code="200"} 1"#
     ));
     assert!(
         ctx.registry
