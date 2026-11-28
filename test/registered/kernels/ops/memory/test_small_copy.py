@@ -285,6 +285,30 @@ class TestSmallFieldCopy(CustomTestCase):
         self.assertTrue(plan([d0, d1], [s0, s1]))
         self.assertTrue(torch.equal(d0, s0.long()))
 
+    def test_cached_plans_follow_each_call(self):
+        """cached_small_field_copy keeps one plan per destination layout: new sources,
+        a source with another stride, and a destination reallocated at the same
+        address all write what torch._foreach_copy_ writes."""
+        cuda = dict(device="cuda")
+        base = torch.empty(16, dtype=torch.int64, **cuda)
+        dsts = [base[:8], torch.empty((2, 4), dtype=torch.int32, **cuda)]
+        for step in range(5):
+            n = 4 if step == 4 else 8
+            srcs = [
+                torch.randint(0, 1000, (n,), **cuda),
+                torch.randint(0, 100, (2, 4), dtype=torch.int32, **cuda),
+            ]
+            if step == 2:
+                srcs[1] = torch.randint(0, 100, (4, 4), dtype=torch.int32, **cuda)[::2]
+            if step >= 3:
+                # A new view at the same address: same layout, then a shorter one.
+                dsts[0] = base.view(-1)[:n]
+            want = [torch.empty_like(d) for d in dsts]
+            torch._foreach_copy_(want, srcs)
+            self.assertTrue(small_field_copy_module.cached_small_field_copy(dsts, srcs))
+            for dst, ref in zip(dsts, want):
+                self.assertTrue(torch.equal(_raw_bits(dst), _raw_bits(ref)))
+
     def test_plan_reads_pinned_host_sources_only_when_allowed(self):
         """The post-verify graphs stage a host-drawn scalar with their device inputs
         in one launch: a plan that allows it reads page-locked host memory, and every

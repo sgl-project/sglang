@@ -9,6 +9,8 @@ field plus a C++ range check, so the per-call host cost stays small.
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -18,6 +20,8 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+logger = logging.getLogger(__name__)
 
 _MAX_FIELDS = 16
 _ENTRIES = 7
@@ -145,6 +149,52 @@ class SmallFieldCopyPlan:
         return _run_host_desc(dsts[0], self._desc)
 
 
+# The kernel is CUDA C++; ROCm builds keep the caller's stock copy.
+_CUDA_BUILD = torch.version.cuda is not None
+_KERNEL_OK: Optional[bool] = None
+_PLANS: OrderedDict = OrderedDict()
+_MAX_PLANS = 256
+# try_small_copy's per-field bound: a larger field copies faster through torch._foreach_copy_.
+_MAX_PLAN_FIELD_NUMEL = 8192
+
+
+def small_field_copy_available() -> bool:
+    """Builds the kernel once (the graph-input registry calls this at startup); after a
+    failed build every caller keeps its stock copy instead of raising on replay."""
+    global _KERNEL_OK
+    if _KERNEL_OK is None:
+        _KERNEL_OK = _CUDA_BUILD
+        if _KERNEL_OK:
+            try:
+                _jit_small_field_copy_module()
+            except Exception as exc:  # noqa: BLE001 - any build failure keeps the stock copy
+                logger.warning(
+                    "Small-field copy kernel not built, using the stock copy: %s", exc
+                )
+                _KERNEL_OK = False
+    return _KERNEL_OK
+
+
+def cached_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    """One-launch copy through a SmallFieldCopyPlan per destination layout (pointer,
+    shape, stride, dtype of every destination; least recently used evicted first);
+    False when a field is not supported or the kernel is unavailable."""
+    if len(dsts) > _MAX_FIELDS or not small_field_copy_available():
+        return False
+    for d in dsts:
+        if d.numel() > _MAX_PLAN_FIELD_NUMEL:
+            return False
+    key = tuple((d.data_ptr(), d.shape, d.stride(), d.dtype) for d in dsts)
+    plan = _PLANS.get(key)
+    if plan is None:
+        if len(_PLANS) >= _MAX_PLANS:
+            _PLANS.popitem(last=False)
+        plan = _PLANS[key] = SmallFieldCopyPlan()
+    else:
+        _PLANS.move_to_end(key)
+    return plan(dsts, srcs)
+
+
 def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     module = _jit_small_field_copy_module()
     run = (
@@ -155,4 +205,8 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
-__all__ = ["SmallFieldCopyPlan"]
+__all__ = [
+    "SmallFieldCopyPlan",
+    "cached_small_field_copy",
+    "small_field_copy_available",
+]
