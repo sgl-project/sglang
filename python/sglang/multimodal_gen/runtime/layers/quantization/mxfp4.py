@@ -25,6 +25,7 @@ _is_hip = is_hip()
 if _is_hip:
     try:
         import aiter
+        from aiter import QuantType, get_hip_quant
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
         from aiter.ops.shuffle import shuffle_weight
         from aiter.utility.fp4_utils import dynamic_mxfp4_quant
@@ -34,6 +35,8 @@ if _is_hip:
         shuffle_weight = None
         dynamic_mxfp4_quant = None
         gemm_a4w4 = None
+        get_hip_quant = None
+        QuantType = None
 
 # The gemm_a4w4 ASM kernel has degraded precision when the output
 # dimension (N) is smaller than its minimum tile size.
@@ -41,14 +44,19 @@ if _is_hip:
 _MXFP4_MIN_OUTPUT_DIM = 256
 
 
-if _is_hip and gemm_a4w4 is not None and dynamic_mxfp4_quant is not None:
+if _is_hip and gemm_a4w4 is not None and get_hip_quant is not None:
+    # AITER's HIP per-1x32 MX quantizer writes the same packed FP4 blob and
+    # E8M0 scales as dynamic_mxfp4_quant, and is the faster of the two on gfx95x.
+    _activation_quant = get_hip_quant(QuantType.per_1x32)
 
     def _mxfp4_quant_gemm(
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-        x_fp4, x_scale = dynamic_mxfp4_quant(x, shuffle=True)
+        # The HIP quantizer reads each row as one dense run, so the input must
+        # have a contiguous last dimension; this is a no-op when it already does.
+        x_fp4, x_scale = _activation_quant(x.contiguous(), shuffle=True)
         return gemm_a4w4(x_fp4, weight, x_scale, weight_scale)
 
     def _mxfp4_quant_gemm_fake(
