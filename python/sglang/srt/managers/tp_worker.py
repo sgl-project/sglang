@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
@@ -199,12 +200,15 @@ class BaseTpWorker(ABC):
         return success, message
 
     def deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
+        """Each rank deserializes only its own payload, at its engine world rank
+        (tp_size * pp_rank + tp_rank); deserializing another rank's copy would
+        break producer-side CUDA-IPC refcounting."""
+        parallel = get_parallel()
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[get_parallel().tp_rank]
+            serialized_named_tensors[
+                parallel.tp_size * parallel.pp_rank + parallel.tp_rank
+            ]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -752,6 +756,16 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            if batch is not None and is_beam_only_batch(batch):
+                # The beam coordinator selects the tokens. The placeholder sets
+                # has_sampled_token_ids, which gates the scheduler's relay, CPU
+                # copy and result processing; beam reqs never read its values.
+                batch_result.next_token_ids = torch.zeros(
+                    len(batch.reqs), dtype=torch.int64
+                )
+                self._maybe_finalize_elastic_cuda_graph_scale()
                 return batch_result
 
             # Delay sampling only for normal generation requests.
