@@ -81,6 +81,18 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
+        # An explicit cuTile request must reach the supported quantization
+        # scheme; silently selecting another per-layer runner hides a mismatch.
+        if (
+            get_moe_runner_backend().is_flashinfer_cutile()
+            and not runner_backend.is_flashinfer_cutile()
+        ):
+            raise ValueError(
+                "--moe-runner-backend flashinfer_cutile was requested, but this "
+                f"MoE layer selected the '{runner_backend.value}' runner. "
+                "FlashInfer cuTile currently supports MiniMax-M3.1 NVFP4 experts only."
+            )
+
         if get_moe_a2a_backend().is_deepep_v2() and not runner_backend.is_deep_gemm():
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
@@ -124,6 +136,14 @@ class MoeRunner:
             or runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_flashinfer_cutile():
+            if lora_enabled:
+                raise ValueError("FlashInfer cuTile does not support LoRA")
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+                FlashInferCuTileRunnerCore,
+            )
+
+            self.runner_core = FlashInferCuTileRunnerCore(config)
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
         elif runner_backend.is_flashinfer_cutlass():

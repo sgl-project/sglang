@@ -87,6 +87,10 @@ def handle_moe_kernel_config(server_args: Any):
                 "--paged-experts-host-memory-gb must be a finite number greater than 0."
             )
 
+    # Reject unsupported explicit requests before the quantization pass can
+    # replace the requested backend with a fallback.
+    _validate_flashinfer_cutile_config(cfg)
+
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
@@ -174,6 +178,55 @@ def handle_moe_kernel_config(server_args: Any):
     ]:
         assert resolved_view(server_args).ep_size == 1, (
             "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+        )
+
+
+def _validate_flashinfer_cutile_config(cfg: Any) -> None:
+    if cfg.moe_runner_backend != "flashinfer_cutile":
+        return
+
+    requirements = (
+        (
+            cfg.quantization == "minimax_m3_nvfp4",
+            "requires --quantization minimax_m3_nvfp4",
+        ),
+        (cfg.ep_size == 1, "requires --ep-size 1"),
+        (cfg.moe_a2a_backend == "none", "requires --moe-a2a-backend none"),
+        (not cfg.enable_lora, "does not support LoRA"),
+        (
+            cfg.dtype in ("auto", "bfloat16"),
+            "requires BF16 activations (--dtype bfloat16 or auto)",
+        ),
+        (
+            cfg.speculative_algorithm is None,
+            "does not yet support speculative decoding",
+        ),
+        (not cfg.enable_paged_experts, "does not support paged experts"),
+        # Prepared tensors live in FlashInfer's weight pack, outside the
+        # registered parameters traversed by SGLang's CPU offload mechanisms.
+        (cfg.cpu_offload_gb <= 0, "does not support --cpu-offload-gb"),
+        (cfg.offload_group_size <= 0, "does not support --offload-group-size"),
+        # Without a backup, memory saver can discard weight contents and
+        # require a reload on resume. cuTile rejects that reload, so require
+        # allocation-level CPU backup before permitting memory saver at all.
+        (
+            not cfg.enable_memory_saver or cfg.enable_weights_cpu_backup,
+            "requires --enable-weights-cpu-backup with --enable-memory-saver",
+        ),
+        # Presharded files are an export/reload format. This version cannot
+        # serialize a complete checkpoint from the prepared execution pack.
+        (
+            cfg.load_format != "presharded",
+            "does not support --load-format presharded because prepared weights "
+            "cannot be exported",
+        ),
+    )
+    for satisfied, message in requirements:
+        if not satisfied:
+            raise ValueError(f"--moe-runner-backend flashinfer_cutile {message}")
+    if get_platform().device_sm not in (120, 121):
+        raise ValueError(
+            "--moe-runner-backend flashinfer_cutile requires SM120 or SM121"
         )
 
 
