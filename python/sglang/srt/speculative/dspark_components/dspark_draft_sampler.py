@@ -70,12 +70,10 @@ class DsparkDraftSampler:
                 (self.max_bs * self.gamma,), dtype=torch.int64, device=device
             )
         # [max_bs, gamma + 1] verify ids ([anchor | draft tokens]) written by the
-        # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
-        self.verify_ids: Optional[torch.Tensor] = None
-        if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
-            self.verify_ids = torch.empty(
-                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
-            )
+        # graph tail, so the step skips its eager concat.
+        self.verify_ids = torch.empty(
+            (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
+        )
         confidence_head = model.confidence_head
         self.acceptance_estimator = acceptance_estimator
         self.acceptance_features_out: Optional[torch.Tensor] = None

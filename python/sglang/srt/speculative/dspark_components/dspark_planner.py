@@ -889,7 +889,7 @@ def alloc_verify_window(
 ) -> VerifyWindow:
     """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
     plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
-    by the same launch (SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE)."""
+    by the same launch."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = None

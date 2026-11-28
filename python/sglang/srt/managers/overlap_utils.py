@@ -100,7 +100,7 @@ def _assert_nonneg_and_invalidate(
 
 class FutureRelayBuffers:
     """Seq-lens / bonus buffers a static verify graph scatters into; captured before
-    the FutureMap exists, which adopts them (SGLANG_OPT_DSV41_DSPARK_POST_FOLD)."""
+    the FutureMap exists, which adopts them."""
 
     def __init__(self, *, req_pool_size: int, device) -> None:
         self.new_seq_lens = torch.empty(

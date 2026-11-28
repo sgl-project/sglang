@@ -1,4 +1,4 @@
-"""SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH: the static verify epilogue records the
+"""The static verify epilogue records the
 engram history commit, gated per row, and reports it only when it was captured."""
 
 import sys
@@ -79,7 +79,6 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi.simulated_correct_len = None
     epi.simulate_fold = False
     epi._fused_accept_tail = fused
-    epi._accept_tail_bs = (1, 0)
     epi._accept_tail_logged = set()
     epi._tp_sync = SimpleNamespace(sync=lambda site, t: None, enabled=lambda s: False)
     epi.folds_engram_commit = False
@@ -94,7 +93,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
 
 
 def test_engram_history_fused_accept_tail_matches_unfused(monkeypatch):
-    """SGLANG_DSPARK_FUSED_ACCEPT_TAIL returns only gated lengths; the in-graph engram
+    """The fused accept tail returns only gated lengths; the in-graph engram
     commit must still see the ungated ones, so both accepts leave the same history."""
     monkeypatch.setattr(dspark_verify, "engram_commit_history", _commit_reference)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)

@@ -182,7 +182,7 @@ class TestInGraphBlockAcceptLens(unittest.TestCase):
 
 
 class TestPostFoldRelay(unittest.TestCase):
-    """SGLANG_OPT_DSV41_DSPARK_POST_FOLD: the static verify graph scatters new seq
+    """The static verify graph scatters new seq
     lens and bonus into slot-indexed buffers the FutureMap adopts; the host skips
     its scatter only for the exact tensors the worker marks as relayed."""
 

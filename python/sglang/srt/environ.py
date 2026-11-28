@@ -650,31 +650,9 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
-    # greedy accept and its bookkeeping as one kernel.
-    SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
-    SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
-    # Static verify graphs stage the draft KV store; the next draft graph
-    # writes it on a side stream forked at its head, joined at its first KV store.
-    SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
     # and joins at the first draft KV store, overlapping the embedding.
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark static verify: the verify graph scatters new seq lens and the bonus into
-    # the FutureMap's slots; the host skips those scatters for folded accepts.
-    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
-    # the plan-time load already copied from the same tensors.
-    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
@@ -683,11 +661,6 @@ class Envs:
     # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
     # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # The deferred draft KV store's staging (write locations, positions, state slots,
-    # commit lengths) in one Triton launch instead of four copies and a fill.
-    SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
 
@@ -2338,16 +2311,6 @@ class Envs:
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    # DSpark decode: build the verify window and the draft anchor column in one
-    # launch instead of two adds, assign_extend_cache_locs and a copy.
-    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
-    # into the sampler's own buffer, so the step skips its eager concat.
-    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
     SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
@@ -2367,11 +2330,6 @@ class Envs:
     # give every request this many pages of headroom in the same allocation (capped
     # at 8; 0 = off). Skipped when free pages are low and under HiSparse.
     SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES = EnvInt(2)
-    # DSpark static verify: record the post-verify engram history commit in the
-    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
-    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
     # sampling accept and commits as a CUDA graph right after the verify graph.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
@@ -2875,7 +2833,21 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    name: _DeprecatedEnv(note="DSpark always runs this path now; unset it.")
+    for name in (
+        "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE",
+        "SGLANG_OPT_DSV41_DSPARK_MID_FOLD",
+        "SGLANG_OPT_DSV41_DSPARK_POST_FOLD",
+        "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS",
+        "SGLANG_DSPARK_FUSED_ACCEPT_TAIL",
+        "SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS",
+        "SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS",
+        "SGLANG_DSPARK_DEFER_CONTEXT_KV",
+        "SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE",
+        "SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH",
+    )
+}
 
 
 def _handle_deprecated_envs():
