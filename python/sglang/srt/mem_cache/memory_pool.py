@@ -4925,7 +4925,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
         dcp_replicated: bool = False,
+        fixed_fabric_pool: bool = False,
     ):
+        if fixed_fabric_pool and type(self) is not DSATokenToKVPool:
+            # Only the built-in DSA pool validates the GLM layout the owner assumes.
+            raise ValueError("fixed FABRIC backing requires the built-in DSA pool")
         super().__init__(
             size,
             page_size,
@@ -4937,6 +4941,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             end_layer,
         )
 
+        self.fixed_fabric_pool = fixed_fabric_pool
+        self._fixed_fabric_owner = None
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
@@ -5016,6 +5022,19 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         return self.size + self.page_size
 
     def _create_buffers(self):
+        if self.fixed_fabric_pool:
+            from sglang.srt.mem_cache.fixed_fabric_pool import FixedFabricBufferOwner
+
+            if self.custom_mem_pool is not None:
+                raise ValueError("fixed FABRIC backing cannot use a custom memory pool")
+            self._fixed_fabric_owner = FixedFabricBufferOwner(
+                device=self.device,
+                dtype=self.store_dtype,
+                shapes=[(self.size + self.page_size, 1, self.kv_cache_dim)]
+                * self.layer_num,
+            )
+            self.kv_buffer = list(self._fixed_fabric_owner.tensors)
+            return
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -5544,7 +5563,29 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
+        fixed_fabric_pool: bool = False,
     ):
+        if fixed_fabric_pool:
+            from sglang.srt.mem_cache.fixed_fabric_pool import validate_glm_geometry
+
+            validate_glm_geometry(
+                size=size,
+                page_size=page_size,
+                layer_num=layer_num,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_cache_dim=kv_cache_dim,
+                index_head_dim=index_head_dim,
+                dtype=dtype,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool_compress,
+                tail_extra_slots=tail_extra_slots,
+                skip_topk_layers=skip_topk_layers,
+                index_buf_size=index_buf_size,
+                dcp_replicated=dcp_replicated,
+                enable_memory_saver=enable_memory_saver,
+                use_fp4_indexer=use_fp4_indexer,
+            )
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -5563,6 +5604,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             use_dsa=True,
             override_kv_cache_dim=override_dim,
             dcp_replicated=dcp_replicated,
+            fixed_fabric_pool=fixed_fabric_pool,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
         # Only the raw fp8 layout (no fp8_ds_mla tiles) casts on write.
