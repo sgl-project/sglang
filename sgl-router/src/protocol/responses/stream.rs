@@ -183,7 +183,7 @@ impl ResponsesStream {
             return;
         }
         if !matches!(self.open, Some(Open::Reasoning { .. })) {
-            self.close_open(Finish::Completed, out);
+            self.close_open_with_phase(Finish::Completed, Some("commentary"), out);
             let id = new_id("rs");
             let index = self.next_index();
             let mut item = reasoning_item(&id, "", "in_progress", &self.echo);
@@ -297,7 +297,7 @@ impl ResponsesStream {
                 // Only a new call follows held text in generation order; a
                 // continuing delta is the engine sending a step's text first.
                 self.last_held = false;
-                self.close_open(Finish::Completed, out);
+                self.close_open_with_phase(Finish::Completed, Some("commentary"), out);
                 let call = Call {
                     id: new_id("fc"),
                     index: self.next_index(),
@@ -340,6 +340,11 @@ impl ResponsesStream {
     }
 
     fn close_open(&mut self, finish: Finish, out: &mut Vec<u8>) {
+        let phase = (finish != Finish::Aborted).then_some("final_answer");
+        self.close_open_with_phase(finish, phase, out);
+    }
+
+    fn close_open_with_phase(&mut self, finish: Finish, phase: Option<&str>, out: &mut Vec<u8>) {
         let Some(open) = self.open.take() else {
             return;
         };
@@ -390,7 +395,11 @@ impl ResponsesStream {
                            "part": output_text_part(&text)}),
                     out,
                 );
-                (index, message_item(&id, &text, finish.item_status()))
+                let mut item = message_item(&id, &text, finish.item_status());
+                if let Some(phase) = phase {
+                    item["phase"] = phase.into();
+                }
+                (index, item)
             }
         };
         self.item_done(index, item, out);
@@ -462,7 +471,11 @@ impl ResponsesStream {
         };
         self.close_calls(calls_finish, out);
         self.flush_held(out);
-        self.close_open(held_finish, out);
+        if reason == "tool_calls" {
+            self.close_open_with_phase(held_finish, Some("commentary"), out);
+        } else {
+            self.close_open(held_finish, out);
+        }
         let mut resp = self.response(finish.status());
         finish.annotate(&mut resp);
         self.emit(finish.event(), json!({ "response": resp }), out);
@@ -850,6 +863,35 @@ mod tests {
         let mut c = call(name, args);
         c["tool_calls"][0]["index"] = json!(index);
         c
+    }
+
+    #[test]
+    fn text_buffered_until_a_tool_finish_is_commentary() {
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content":"checking"}), Some("tool_calls")),
+        ]);
+        let output = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[1]["phase"], "commentary");
+    }
+
+    #[test]
+    fn finished_messages_include_their_phase() {
+        let evs = run(&[
+            chunk(json!({"content":"checking"}), None),
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content":"answer"}), Some("stop")),
+        ]);
+        let output = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(output[0]["phase"], "commentary");
+        assert_eq!(output[2]["phase"], "final_answer");
+        let phases: Vec<_> = evs
+            .iter()
+            .filter(|(e, d)| e == "response.output_item.done" && d["item"]["type"] == "message")
+            .map(|(_, d)| d["item"]["phase"].as_str().unwrap())
+            .collect();
+        assert_eq!(phases, ["commentary", "final_answer"]);
     }
 
     #[test]

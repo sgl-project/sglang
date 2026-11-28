@@ -50,11 +50,14 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
     }
     // Emit a message item unless there are tool calls or only reasoning.
     if content.is_some() || (tool_calls.is_none() && output.is_empty()) {
-        output.push(message_item(
-            &new_id("msg"),
-            content.unwrap_or(""),
-            message_status,
-        ));
+        let mut item = message_item(&new_id("msg"), content.unwrap_or(""), message_status);
+        item["phase"] = if tool_calls.is_some() {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+        .into();
+        output.push(item);
     }
     let calls = tool_calls.map_or(&[][..], Vec::as_slice);
     for (i, tc) in calls.iter().enumerate() {
@@ -165,6 +168,23 @@ mod tests {
         let out = r["output"].as_array().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "reasoning");
+    }
+
+    #[test]
+    fn buffered_message_phase_distinguishes_tool_preambles() {
+        for (calls, phase) in [
+            (json!([]), "final_answer"),
+            (
+                json!([{"id":"c","function":{"name":"f","arguments":"{}"}}]),
+                "commentary",
+            ),
+        ] {
+            let chat = json!({"choices":[{"finish_reason":"stop","message":{"content":"hello","tool_calls":calls}}]});
+            assert_eq!(
+                chat_to_response(&chat, &echo())["output"][0]["phase"],
+                phase
+            );
+        }
     }
 
     #[test]
