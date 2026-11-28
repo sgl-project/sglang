@@ -16,6 +16,8 @@ QuantizationMethods = Literal[
     "modelslim",
     "mxfp8",
     "mxfp4",
+    "mxfp6",
+    "a6w4",
     "mxfp4_npu",
     "convrot_int8",
 ]
@@ -28,6 +30,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
     # Quantized linear methods import LinearBase; load them after module initialization.
+    from sglang.multimodal_gen.runtime.layers.quantization.a6w4 import A6W4Config
     from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
         AutoRoundConfig,
     )
@@ -52,6 +55,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
         NPUMXFP4Config,
     )
+    from sglang.multimodal_gen.runtime.layers.quantization.mxfp6 import Mxfp6Config
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
@@ -63,6 +67,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "modelslim": ModelSlimConfig,
         "fp8": Fp8Config,
         "mxfp4": Mxfp4Config,
+        "mxfp6": Mxfp6Config,
+        "a6w4": A6W4Config,
         "mxfp8": MXFP8Config,
         "mxfp4_npu": NPUMXFP4Config,
         "convrot_int8": ConvRotInt8Config,

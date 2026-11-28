@@ -1533,7 +1533,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         # The online methods that honour `ignored_layers` in their
         # `get_quant_method` must be handed the CLI patterns.
         ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
-        for method in ("fp8", "mxfp4", "convrot_int8"):
+        for method in ("fp8", "mxfp4", "mxfp6", "a6w4", "convrot_int8"):
             with self.subTest(method=method):
                 quant_config = self._resolve_online_quant_config(method, ignored_layers)
                 self.assertEqual(quant_config.ignored_layers, ignored_layers)
