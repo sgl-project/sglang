@@ -4,7 +4,8 @@ kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. The ai
 hands its large-M (prefill) calls to the FlyDSL kernel of mxfp8_flydsl_gfx95 on the same
 weight when FlyDSL is installed. The fused gfx950 producers hand these
 routes their operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an
-Mxfp8Activation."""
+Mxfp8Activation. Native MXFP8 checkpoints share the weight preparation: dot_scaled
+keeps the checkpoint tensors, aiter's MXFP8 GEMM preshuffles the weight."""
 
 from __future__ import annotations
 
@@ -43,6 +44,19 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
         # dot_scaled reads canonical [N, K // 32] e8m0 bytes; block scales stay for direct readers
         if scale_u8 is not None:
             copy_or_rebind_param(layer, "weight_scale_inv_mx", scale_u8.contiguous())
+        return
+    if backend.is_gfx95_mxfp8_aiter_1x32():
+        # native MXFP8: aiter reads the [N, K // 32] ue8m0 scale bytes as loaded
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import aiter_preshuffle_fits
+
+        n, k = layer.weight.shape
+        layer.mxfp8_aiter_preshuffled = aiter_preshuffle_fits(n, k)
+        if layer.mxfp8_aiter_preshuffled:
+            copy_or_rebind_param(
+                layer, "weight", shuffle_weight(layer.weight.data, (16, 16))
+            )
         return
     if backend.is_gfx95_mxfp8_aiter():
         # the weight stays [N, K]; aiter reads the block scales compact, one row per 32 output rows
