@@ -768,29 +768,49 @@ def test_multimodal_requires_explicit_enable(tmp_path):
     assert enabled.hf_config.vision_config == _RELEASE_CONFIG["vision_config"]
 
 
-def test_mxfp8_cache_needs_the_fused_decode_prologue(monkeypatch):
+def test_mxfp8_cache_needs_the_fused_decode_prologue():
     """SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
     kernel, so attention without the fused decode prologue fails at construction
-    on a worker that decodes; a PD prefill worker, other caches and FA4's MXFP8
-    path build as before."""
+    on any worker that can decode. A PD prefill worker with no role switch and no
+    decode graph capture, other caches and FA4's MXFP8 path build as before."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.models.inkling_common import inkling2_attn
+    from sglang.srt.runtime_context import get_context
 
-    def build(sm, kv_cache_dtype, fused, mode="null"):
-        model = SimpleNamespace(kv_cache_dtype=kv_cache_dtype)
-        disagg = SimpleNamespace(disaggregation_mode=mode)
-        monkeypatch.setattr(inkling2_attn, "get_model", lambda: model)
-        monkeypatch.setattr(inkling2_attn, "get_disagg", lambda: disagg)
-        with override_platform(is_sm90=sm == 90, is_sm120=sm == 120, device_sm=sm):
+    def build(
+        sm,
+        kv_cache_dtype="mxfp8",
+        fused=False,
+        mode="null",
+        role_switch=False,
+        decode_graph=Backend.DISABLED,
+    ):
+        graphs = SimpleNamespace(decode=SimpleNamespace(backend=decode_graph))
+        with (
+            get_context().override_server_args(
+                kv_cache_dtype=kv_cache_dtype,
+                disaggregation_mode=mode,
+                enable_pd_role_switch=role_switch,
+                cuda_graph_config=graphs,
+            ),
+            override_platform(is_sm90=sm == 90, is_sm120=sm == 120, device_sm=sm),
+        ):
             inkling2_attn._check_mxfp8_decode_prologue(fused)
 
+    decoding_workers = [
+        dict(mode="null"),
+        dict(mode="decode"),
+        dict(mode="prefill", role_switch=True),
+        dict(mode="prefill", decode_graph=Backend.FULL),
+    ]
     for sm in (90, 120):
-        for mode in ("null", "decode"):
+        for worker in decoding_workers:
             with pytest.raises(ValueError, match=f"mxfp8 on SM{sm} needs"):
-                build(sm, "mxfp8", fused=False, mode=mode)
-        build(sm, "mxfp8", fused=False, mode="prefill")
-        build(sm, "mxfp8", fused=True)
-        build(sm, "auto", fused=False)
-    build(100, "mxfp8", fused=False)
+                build(sm, **worker)
+        build(sm, mode="prefill")
+        build(sm, fused=True)
+        build(sm, kv_cache_dtype="auto")
+    build(100)
 
 
 if __name__ == "__main__":

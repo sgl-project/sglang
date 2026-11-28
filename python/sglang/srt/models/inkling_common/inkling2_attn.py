@@ -26,6 +26,11 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -62,14 +67,24 @@ def wave_fill_splits(tiles, sms, max_splits=128, min_fill=0.9):
     return best
 
 
+def _worker_can_decode():
+    # A PD prefill worker decodes only after a role switch or in a decode graph capture.
+    disagg = get_disagg()
+    return not (
+        disagg.disaggregation_mode == "prefill"
+        and not disagg.enable_pd_role_switch
+        and check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+    )
+
+
 def _check_mxfp8_decode_prologue(fused_decode_prologue):
     # SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
-    # kernel, which runs on the fused decode prologue; a PD prefill worker never decodes.
+    # kernel, which runs on the fused decode prologue.
     if (
         not fused_decode_prologue
-        and get_disagg().disaggregation_mode != "prefill"
         and get_model().kv_cache_dtype == "mxfp8"
         and mxfp8_kv_via_bf16(platform=get_platform())
+        and _worker_can_decode()
     ):
         raise ValueError(
             f"--kv-cache-dtype mxfp8 on SM{get_platform().device_sm} needs Inkling 2's "
