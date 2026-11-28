@@ -88,10 +88,19 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_get_calls = []
             self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
+            self.fail_put_keys = set()
+            self.fail_get_keys = set()
             type(self).instances.append(self)
+
+        @staticmethod
+        def _read_bytes(size):
+            # Mooncake reports the bytes read per key; multi-buffer sizes are
+            # per-object lists.
+            return sum(size) if isinstance(size, list) else size
 
         def setup(self, *args, **kwargs):
             return 0
@@ -123,8 +132,10 @@ def _fake_store_class():
                     "args": args,
                 }
             )
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
+            self.existing_keys.update(
+                key for key in keys if key not in self.fail_put_keys
+            )
+            return [-1 if key in self.fail_put_keys else 0 for key in keys]
 
         def batch_put_from_multi_buffers(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -136,8 +147,38 @@ def _fake_store_class():
                     "args": args,
                 }
             )
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
+            self.existing_keys.update(
+                key for key in keys if key not in self.fail_put_keys
+            )
+            return [-1 if key in self.fail_put_keys else 0 for key in keys]
+
+        def batch_get_into(self, keys, ptrs, sizes, *args):
+            self.batch_get_calls.append(
+                {
+                    "method": "batch_get_into",
+                    "keys": list(keys),
+                    "ptrs": list(ptrs),
+                    "sizes": list(sizes),
+                }
+            )
+            return [
+                -1 if key in self.fail_get_keys else self._read_bytes(size)
+                for key, size in zip(keys, sizes)
+            ]
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes, *args):
+            self.batch_get_calls.append(
+                {
+                    "method": "batch_get_into_multi_buffers",
+                    "keys": list(keys),
+                    "ptrs": list(ptrs),
+                    "sizes": list(sizes),
+                }
+            )
+            return [
+                -1 if key in self.fail_get_keys else self._read_bytes(size)
+                for key, size in zip(keys, sizes)
+            ]
 
     return FakeMooncakeDistributedStore
 
@@ -218,6 +259,7 @@ def _make_config(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    enable_storage_metrics=False,
 ):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
@@ -236,7 +278,7 @@ def _make_config(
         attn_cp_rank=0,
         attn_cp_size=1,
         is_mla_model=is_mla_model,
-        enable_storage_metrics=False,
+        enable_storage_metrics=enable_storage_metrics,
         is_page_first_layout=True,
         model_name=model_name,
         tp_lcm_size=tp_lcm_size,
@@ -257,6 +299,7 @@ def _make_store(
     tp_size=1,
     tp_lcm_size=None,
     storage_config=None,
+    enable_storage_metrics=False,
 ):
     fake_store_cls = _fake_store_class()
     cfg = storage_config or _make_config(
@@ -268,6 +311,7 @@ def _make_store(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_lcm_size=tp_lcm_size,
+        enable_storage_metrics=enable_storage_metrics,
     )
 
     with patch.dict(
@@ -857,6 +901,264 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(keys_a, ["org-model-a_page0_0_k", "org-model-a_page0_0_v"])
         self.assertEqual(keys_b, ["org-model-b_page0_0_k", "org-model-b_page0_0_v"])
         self.assertTrue(set(keys_a).isdisjoint(keys_b))
+
+
+class TestMooncakeStorageMetrics(CustomTestCase):
+    """v2 L3 I/O must produce storage bandwidth samples for logical-anchor
+    models (e.g. DeepSeek V4), whose v1 path is a no-op."""
+
+    def test_v2_set_records_backup_metrics(self):
+        store, _ = _make_store(extra_backend_tag="tag", enable_storage_metrics=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(store.backup_pgs, [2])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
+        self.assertEqual(store.prefetch_pgs, [])
+        self.assertEqual(store.prefetch_bandwidth, [])
+        # get_stats drains the pending samples.
+        stats = store.get_stats()
+        self.assertEqual(stats.backup_pgs, [2])
+        self.assertEqual(len(stats.backup_bandwidth), 1)
+        self.assertEqual(store.backup_pgs, [])
+        self.assertEqual(store.backup_bandwidth, [])
+
+    def test_v2_set_metrics_count_only_missing_pages(self):
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        fake_store.existing_keys.update({"tag_page1__indexer"})
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([0, 1, 2]),
+                )
+            ]
+        )
+
+        self.assertEqual(store.backup_pgs, [2])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
+
+    def test_v2_get_records_prefetch_metrics_for_mixed_pools(self):
+        """The same logical page fetched through two pools counts once, like
+        the v1 pages metric."""
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+            ]
+        )
+
+        self.assertEqual(store.prefetch_pgs, [1])
+        self.assertEqual(len(store.prefetch_bandwidth), 1)
+        self.assertGreater(store.prefetch_bandwidth[0], 0)
+        self.assertEqual(len(fake_store.batch_get_calls), 1)
+
+    def test_v2_set_metrics_dedupe_logical_pages_across_pools(self):
+        """The same logical page backed up into two pools counts once in the
+        pages metric, like the v1 pages metric."""
+        store, _ = _make_store(extra_backend_tag="tag", enable_storage_metrics=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+            ]
+        )
+
+        self.assertEqual(store.backup_pgs, [1])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
+
+    def test_v2_metrics_disabled_by_config(self):
+        store, _ = _make_store(extra_backend_tag="tag")
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        )
+        stats = store.get_stats()
+
+        self.assertEqual(store.backup_pgs, [])
+        self.assertEqual(store.backup_bandwidth, [])
+        self.assertEqual(stats.backup_pgs, [])
+        self.assertEqual(stats.backup_bandwidth, [])
+
+    def test_v2_set_metrics_count_partly_stored_pages(self):
+        """A page completed by putting only its missing objects counts as one
+        backed-up page."""
+
+        class RecordingKVDraftPool:
+            page_size = 1
+
+            def __init__(self):
+                self.kv_buffer = torch.empty((128,), dtype=torch.uint8)
+
+            def get_page_buffer_meta(self, indices):
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([5000 + int(i) * 10, 5001 + int(i) * 10])
+                    sizes.extend([8, 8])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(RecordingKVDraftPool(), PoolName.DRAFT)
+        # page0: k stored, v missing; page1: fully stored; page2: fully missing.
+        fake_store.existing_keys.update(
+            {"tag_page0_0_draft_k", "tag_page1_0_draft_k", "tag_page1_0_draft_v"}
+        )
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([5, 6, 7]),
+                )
+            ]
+        )
+
+        # page0 (partly put) and page2 (fully put) both count; page1 does not.
+        self.assertEqual(store.backup_pgs, [2])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
+
+    def test_v2_get_skips_failed_objects(self):
+        """A failed get moved no data: only pages whose objects were all read
+        count, and the bandwidth sample only covers the bytes read."""
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        fake_store.fail_get_keys.update({"tag_page1__indexer"})
+
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.time.perf_counter",
+            side_effect=[0.0, 0.5],
+        ):
+            store.batch_get_v2(
+                [
+                    PoolTransfer(
+                        name=PoolName.INDEXER,
+                        keys=["page0", "page1", "page2"],
+                        host_indices=torch.tensor([0, 1, 2]),
+                    )
+                ]
+            )
+
+        # page1 read failed; page0 and page2 were read (8 bytes each).
+        self.assertEqual(store.prefetch_pgs, [2])
+        self.assertEqual(len(store.prefetch_bandwidth), 1)
+        self.assertEqual(store.prefetch_bandwidth[0], 16 / 0.5 / (1 << 30))
+
+    def test_v2_get_all_failed_records_nothing(self):
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        fake_store.fail_get_keys.update({"tag_page0__indexer"})
+
+        store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        )
+
+        self.assertEqual(store.prefetch_pgs, [])
+        self.assertEqual(store.prefetch_bandwidth, [])
+
+    def test_v2_set_partial_page_failure_does_not_count_page(self):
+        """A page whose objects did not all land is not a backed-up page, and
+        the bandwidth sample only covers the bytes actually written."""
+
+        class TwoObjectDraftPool:
+            page_size = 1
+
+            def __init__(self):
+                self.kv_buffer = torch.empty((128,), dtype=torch.uint8)
+
+            def get_page_buffer_meta(self, indices):
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([5000 + int(i) * 10, 5001 + int(i) * 10])
+                    sizes.extend([8, 8])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(TwoObjectDraftPool(), PoolName.DRAFT)
+        fake_store.fail_put_keys.update({"tag_page1_0_draft_v"})
+
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.time.perf_counter",
+            side_effect=[0.0, 0.5],
+        ):
+            store.batch_set_v2(
+                [
+                    PoolTransfer(
+                        name=PoolName.DRAFT,
+                        keys=["page0", "page1"],
+                        host_indices=torch.tensor([5, 6]),
+                    )
+                ]
+            )
+
+        # page1's v failed, so only page0 is fully backed up.
+        self.assertEqual(store.backup_pgs, [1])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertEqual(store.backup_bandwidth[0], 24 / 0.5 / (1 << 30))
 
 
 if __name__ == "__main__":
