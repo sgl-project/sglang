@@ -30,6 +30,7 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
 from sglang_simulator.time_predictor import ScheduleRequest
+from sglang_simulator.time_predictor.energy import calc_energy_per_token_metrics
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
@@ -579,6 +580,7 @@ class C_SchedulerHook(BaseHook):
                     calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
                 )
                 metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
+                metrics.update(calc_energy_per_token_metrics(metrics))
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:

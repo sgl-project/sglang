@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "joblib",
+    "msgspec>=0.18",
 ]
 
 [project.scripts]

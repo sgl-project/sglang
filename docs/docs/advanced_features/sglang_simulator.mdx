@@ -90,3 +90,51 @@ The output directory contains:
 - `iteration.jsonl`: scheduler batch composition and predicted iteration latency.
 
 Use a unique output directory for each run so metrics from separate experiments are not mixed. See the [SGLang Simulator source README](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator) for simulator configuration fields, predictor examples, and maintained tests.
+
+## Estimate energy
+
+To estimate energy as well as latency, add an `energy` block to the `predictor` section of the simulator configuration. It works with any latency predictor and is off when the block is absent:
+
+```json
+{
+  "predictor": {
+    "name": "ml",
+    "database_path": "latency_model.pkl",
+    "energy": {"calibration_path": "energy_calibration.json"}
+  }
+}
+```
+
+The simulator charges each forward step its calibrated power times its predicted latency. A step is decode when every request in it extends by at most one token, and prefill otherwise. Time between steps, from the first step's start to the last step's end, is charged at idle power. That time includes waiting for requests and the scheduler CPU time that the simulator measures on the machine it runs on. GPUs do not drop to idle the moment a step ends, so an optional `active_gap` charges the first `max_s` seconds of each gap at `power_w`.
+
+`metrics.json` then also contains:
+
+- `energy_total_j`, the sum of `energy_busy_j`, `energy_active_gap_j`, and `energy_idle_j`;
+- `energy_prefill_j` and `energy_decode_j`, which add up to `energy_busy_j`;
+- `energy_busy_s`, `energy_active_gap_s`, and `energy_idle_s`;
+- `energy_avg_power_w`; and
+- `energy_j_per_output_token`, the total energy divided by the output tokens of requests completed in the interval, present when that count is above zero.
+
+This calibration was measured for Qwen3-8B in BF16 on one NVIDIA H100 80GB HBM3 at its default 700 W power limit:
+
+```json
+{
+  "format_version": 1,
+  "idle_power_w": 127.0,
+  "power_limit_w": 700.0,
+  "prefill": {
+    "intercept_w": 618.5,
+    "coefficients_w": {"log1p_sum_extend": 77.4, "log1p_sum_attn_flops": -33.6}
+  },
+  "decode": {
+    "intercept_w": 392.2,
+    "coefficients_w": {"log1p_batch_size": 47.2, "sum_past": 0.000572}
+  },
+  "active_gap": {"power_w": 210.3, "max_s": 0.05},
+  "provenance": {"device": "NVIDIA H100 80GB HBM3", "model": "Qwen/Qwen3-8B", "tp_size": 1}
+}
+```
+
+Phase power is `intercept_w` plus each coefficient times its batch feature. It is clipped below at `idle_power_w` and, when `power_limit_w` is set, above at the limit. Feature names are the 18 features in [`ml_features.py`](https://github.com/sgl-project/sglang/blob/main/tools/sglang-simulator/src/sglang_simulator/time_predictor/ml_features.py), optionally prefixed with `log1p_`. Unknown fields and feature names are rejected.
+
+Watts are totals over all GPUs of the deployment, so use a calibration measured with the same model, GPU type, parallelism, and power limit as the deployment you simulate. The simulator does not include a tool that fits one. To measure a calibration, hold steady-state plateaus of fixed batch shapes on the real server and record each plateau's energy with the cumulative NVML energy counter, because NVML power readings on A100 and H100 sample only part of each period ([Yang et al., 2023](https://arxiv.org/abs/2312.02741)). Record each step's batch features with `sglang-simulator-collect`, then fit the coefficients so that predicted plateau energy matches the measured energy. The collector requires `--disable-overlap-schedule`, so a calibration measured this way describes that scheduling mode.

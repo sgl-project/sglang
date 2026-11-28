@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from sglang_simulator.dataset import GenericRequest, SimpleDataset
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
 
@@ -35,7 +36,7 @@ def make_fixed_dataset(
     )
 
 
-def _write_sim_config(tmp_path: Path) -> Path:
+def _write_sim_config(tmp_path: Path, energy: dict | None = None) -> Path:
     table_path = tmp_path / "replay.json"
     table_path.write_text(
         json.dumps({"[[1, 1024]]": 0.001, "[[1025, 0]]": 0.01}),
@@ -58,13 +59,17 @@ def _write_sim_config(tmp_path: Path) -> Path:
         },
         "scheduler": {"tp_size": 1, "ep_size": 1, "dp_size": 1},
     }
+    if energy is not None:
+        config["predictor"]["energy"] = energy
     config_path = tmp_path / "sim_config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     return config_path
 
 
-def make_sglang_runner(tmp_path: Path):
-    os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = str(_write_sim_config(tmp_path))
+def make_sglang_runner(tmp_path: Path, energy: dict | None = None):
+    os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = str(
+        _write_sim_config(tmp_path, energy=energy)
+    )
 
     from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
     from sglang.srt.server_args import ServerArgs
@@ -115,4 +120,36 @@ def test_benchmark_sglang_runs_paged_decode(tmp_path):
     assert metrics["mean_tpot_ms"] > 0
     assert all(
         idx == 0 or req["created_time"] > 0 for idx, req in enumerate(request_stats)
+    )
+
+
+def test_benchmark_reports_energy(tmp_path):
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "idle_power_w": 50.0,
+                "prefill": {"intercept_w": 300.0},
+                "decode": {"intercept_w": 300.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = make_sglang_runner(tmp_path, energy={"calibration_path": str(calibration)})
+    try:
+        metrics = runner.benchmark(
+            BenchmarkConfig(request_rate=10, ignore_request_timestamp=False),
+            dataset=make_fixed_dataset(2000, 2, input_length=1024, output_length=3),
+        )
+        forward_s = sum(it["forward_latency"] for it in runner.get_iteration_stats())
+    finally:
+        runner.shutdown()
+
+    assert forward_s > 0
+    assert metrics["energy_busy_s"] == pytest.approx(forward_s)
+    assert metrics["energy_busy_j"] == pytest.approx(300.0 * forward_s)
+    assert metrics["energy_idle_s"] > 0
+    assert metrics["energy_j_per_output_token"] == pytest.approx(
+        metrics["energy_total_j"] / metrics["total_output"]
     )
