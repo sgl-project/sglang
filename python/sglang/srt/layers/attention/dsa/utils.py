@@ -159,6 +159,34 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def kv_balanced_row_bounds(
+    seq_lens_cpu: torch.Tensor, extend_lens: list[int], num_rows: int, parts: int
+) -> list[int]:
+    """Contiguous row bounds 0 = b_0 < ... < b_parts = num_rows of an extend
+    batch, balanced by each row's KV length (what the indexer logits, its
+    top-k and the sparse attention cost scale with); host-only math."""
+    seq = seq_lens_cpu.to(torch.int64)
+    if (
+        len(extend_lens) == seq.numel()
+        and sum(extend_lens) == num_rows
+        and min(extend_lens) >= 0
+    ):
+        ext = torch.tensor(extend_lens, dtype=torch.int64)
+        row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
+        row_pos = torch.arange(num_rows, dtype=torch.int64) - row_req_start
+        row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
+        cum = torch.cumsum(row_kv.clamp_(min=1), 0)
+        targets = cum[-1] * torch.arange(1, parts, dtype=torch.int64) // parts
+        cuts = torch.searchsorted(cum, targets, right=True).tolist()
+    else:
+        cuts = [num_rows * r // parts for r in range(1, parts)]
+    bounds = [0]
+    for r, cut in enumerate(cuts, start=1):
+        bounds.append(min(max(cut, bounds[-1] + 1), num_rows - (parts - r)))
+    bounds.append(num_rows)
+    return bounds
+
+
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
     if index_kpool <= 1:
         return original_seq_lens.clamp(max=dsa_index_topk)
