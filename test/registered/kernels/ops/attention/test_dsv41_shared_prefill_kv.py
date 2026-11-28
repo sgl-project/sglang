@@ -175,6 +175,7 @@ def test_h200_cp_real_forward_dispatches_to_bf16_sparse_prefill():
     obj, batch = _h200_cp_backend()
     n, page, width = 3, 64, 584
     pool = obj.token_to_kv_pool
+    pool.get_extra_key_layout.return_value.is_packed_main_kv = False
     pool.get_swa_key_buffer_radix.return_value = torch.zeros(1, page * width)
     pool.get_swa_key_page_size.return_value = page
     pool.get_swa_key_bytes_per_token.return_value = width
@@ -193,7 +194,9 @@ def test_h200_cp_real_forward_dispatches_to_bf16_sparse_prefill():
     with (
         patch.object(backend, "is_cp_active", return_value=True),
         patch.object(
-            backend, "get_platform", return_value=NS(is_sm90=True, is_sm120=False)
+            backend,
+            "get_platform",
+            return_value=NS(is_sm90=True, is_sm100=False, is_sm120=False),
         ),
         patch.object(backend, "use_dsv4_q8kv8_sparse_prefill", return_value=False),
     ):

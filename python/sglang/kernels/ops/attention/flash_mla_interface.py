@@ -10,6 +10,7 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 ``use_legacy=False``. CUDA only: HIP and XPU keep their own sgl-kernel ops.
 """
 
+import importlib
 from typing import Optional, Tuple, Union
 
 import flash_mla
@@ -261,3 +262,102 @@ def flash_mla_sparse_fwd_small_heads(
     return flash_mla.flash_mla_sparse_fwd_small_heads(
         q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
     )
+
+
+def _load_mixed_kv_ops() -> None:
+    try:
+        importlib.import_module("sgl_kernel.flashmla_mixed_ops")
+    except Exception as exc:
+        raise ImportError(
+            "Failed to load the SM90 packed Main-KV FlashMLA extension"
+        ) from exc
+
+
+def get_mla_capabilities() -> dict:
+    """Capabilities of the versioned packed Main-KV extension."""
+    _load_mixed_kv_ops()
+    major, minor = torch.cuda.get_device_capability()
+    supported = (major, minor) == (9, 0)
+    return {
+        "mixed_kvcache_api_version": (
+            torch.ops.sgl_kernel.flashmla_mixed_kv_api_version.default()
+        ),
+        "architecture": f"sm{major}{minor}",
+        "mixed_kvcache_supported": supported,
+        "supported_mixed_layout_pairs": (
+            [["V4", "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"]] if supported else []
+        ),
+        "supported_num_heads": [64, 128],
+        "supported_main_page_slots": [128, 256],
+    }
+
+
+def flash_mla_with_mixed_kvcache(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    main_cache_bytes: torch.Tensor,
+    main_indices: torch.Tensor,
+    swa_layout: str,
+    main_layout: str,
+    main_page_slots: int,
+    main_page_bytes: int,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    swa_topk_length: Optional[torch.Tensor] = None,
+    main_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run SM90 sparse decode over V4 SWA and packed DSV4.1 Main KV."""
+    _load_mixed_kv_ops()
+    assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    config = FlashMLASchedMeta.Config(
+        b=q.shape[0],
+        s_q=q.shape[1],
+        h_q=q.shape[2],
+        page_block_size=swa_cache.shape[1],
+        h_k=swa_cache.shape[2],
+        causal=False,
+        is_fp8_kvcache=True,
+        topk=swa_indices.shape[-1],
+        extra_page_block_size=main_page_slots,
+        extra_topk=main_indices.shape[-1],
+        enable_batch_invariant=False,
+    )
+    if not tile_scheduler_metadata.have_initialized:
+        tile_scheduler_metadata.have_initialized = True
+        tile_scheduler_metadata.config = config
+    else:
+        assert tile_scheduler_metadata.config == config, (
+            "Input arguments are inconsistent with FlashMLASchedMeta. Use "
+            "distinct scheduler metadata for legacy and mixed-v1 calls."
+        )
+
+    out, lse, metadata, splits = (
+        torch.ops.sgl_kernel.sparse_decode_fwd_mixed_v1.default(
+            q,
+            swa_cache,
+            swa_indices,
+            swa_topk_length,
+            main_cache_bytes,
+            main_indices,
+            main_topk_length,
+            attn_sink,
+            tile_scheduler_metadata.tile_scheduler_metadata,
+            tile_scheduler_metadata.num_splits,
+            head_dim_v,
+            softmax_scale,
+            swa_layout,
+            main_layout,
+            main_page_slots,
+            main_page_bytes,
+        )
+    )
+    tile_scheduler_metadata.tile_scheduler_metadata = metadata
+    tile_scheduler_metadata.num_splits = splits
+    return out, lse
