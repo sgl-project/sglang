@@ -1247,6 +1247,18 @@ async def hicache_storage_backend_status():
     }
 
 
+@app.api_route("/unified-cache/external-linker", methods=["PUT", "DELETE"])
+async def update_cache_linker(request: Request):
+    """Re-attach (PUT) or detach (DELETE) the launch-time external linker while all schedulers are idle."""
+    ret = await _global_state.tokenizer_manager.update_cache_linker(
+        attach=request.method == "PUT"
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 # example usage:
 # curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
 @app.get("/get_hicache_l3_cache_layout")
