@@ -868,12 +868,16 @@ __global__ void Marlin(
         }
       } else if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          if (k % b_sh_wr_iters == 0) {
-            int4* sh_s_stage =
-                sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
-            reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
-          } else {
-            reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+          constexpr int g = group_blocks / thread_k_blocks;
+          // Only a group's first tile may read its slot: the cp.async that refills it
+          // is issued while slower warps can still be on the group's later tiles.
+          if (pipe % g == 0) {
+            if (k % b_sh_wr_iters == 0) {
+              int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
+              reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+            } else {
+              reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+            }
           }
         } else {
           auto warp_id = threadIdx.x / 32;
@@ -984,9 +988,10 @@ __global__ void Marlin(
         }
 
       } else if constexpr (group_blocks >= thread_k_blocks) {
-        if (k % b_sh_wr_iters == 0) {
-          int4* sh_zp_stage =
-              sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+        // Same slot reuse as the group scales above.
+        constexpr int g = group_blocks / thread_k_blocks;
+        if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+          int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
 #pragma unroll
           for (int i = 0; i < num_ints_per_thread; i++) {
             frag_qzp[k % 2][i] = (reinterpret_cast<int*>(sh_zp_stage))[zp_sh_rd + i];
@@ -1026,9 +1031,9 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          if (k % b_sh_wr_iters == 0) {
-            int4* sh_zp_stage =
-                sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+          constexpr int g = group_blocks / thread_k_blocks;
+          if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+            int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
             reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] = sh_zp_stage[zp_sh_rd];
           }
         } else {
@@ -1487,6 +1492,11 @@ __global__ void Marlin(
 #pragma unroll
       for (int k = 0; k < b_sh_wr_iters; k++) {
         fetch_to_registers(k + 1, pipe % stages);
+#ifdef SGLANG_MARLIN_TEST_LAG_WARPS_NS
+        // Test-only: every warp but warp 0, which issues the scale and zero-point
+        // cp.async, falls behind before it loads the next tile's group data.
+        if ((k + 1) % b_sh_wr_iters == 0 && threadIdx.x >= 32) __nanosleep(SGLANG_MARLIN_TEST_LAG_WARPS_NS);
+#endif
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
         if (k == b_sh_wr_iters - 2) {
