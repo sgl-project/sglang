@@ -437,7 +437,12 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 1. Mixed-bit Quantization Limitations
 
-    Mixed-bit quantization is not fully supported. Due to vLLM's layer fusion (e.g., QKV fusion), applying different bit-widths to components within the same fused layer can lead to compatibility issues.
+    Mixed-bit quantization is not fully supported by the generic fused-layer
+    path. Due to vLLM's layer fusion (e.g., QKV fusion), applying different
+    bit-widths to components within the same fused layer can lead to
+    compatibility issues. The Intel AMX CPU path described below supports
+    per-layer mixed W4/W8/W16 when all components of a fused module use the
+    same width.
 
 
 2. Limited Support for Quantized MoE Models
@@ -466,7 +471,26 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 - CPU serving
 
-    AutoRound INT4 checkpoints (both `auto_round:auto_gptq` and `auto_round:auto_awq` packing formats) can be served on Intel CPUs with AMX support:
+    AutoRound checkpoints can be served on Intel CPUs with AMX support. The CPU backend supports:
+
+    - 4-bit and 8-bit INT checkpoints in `auto_round:auto_gptq` packing format.
+    - 4-bit INT checkpoints in `auto_round:auto_awq` packing format.
+    - Mixed-precision checkpoints that keep some decoder layers at 16-bit (BF16/FP16).
+
+    AMX executes every INT checkpoint with dynamic per-token INT8 activations:
+    4-bit weights use the W4A8 kernel and 8-bit weights use the W8A8 kernel.
+    SGLang logs this policy once at startup, including the `act_bits` and
+    `act_dynamic` values declared by the checkpoint.
+
+    For 8-bit layers, SGLang dequantizes AutoRound's group-wise weights and
+    requantizes them to per-channel INT8 at load time so they can use the
+    existing AMX W8A8 GEMM. W4 layers keep using the AMX W4A8 kernel, so mixed
+    checkpoints dispatch each layer to its declared precision. W8 remains the
+    higher-accuracy option; the load-time step adds one small additional
+    rounding. Exact group-scale W8 execution would require a separate
+    grouped-scale AMX kernel.
+
+    W4A16 checkpoint example (executed as W4A8 on AMX):
 
     ```bash
     SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
@@ -475,7 +499,26 @@ Several limitations currently affect offline quantized model loading in sglang, 
         --device cpu --trust-remote-code
     ```
 
-    The current SGLang CPU backend supports only 4-bit AutoRound checkpoints on Intel AMX. Other AutoRound bit-widths and non-AMX CPU backends are not supported by this path.
+    W8A16 checkpoint example (executed as W8A8 on AMX):
+
+    ```bash
+    SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
+        --model-path INCModel4/Phi-4-multimodal-instruct-W8A16-AutoRound \
+        --quantization auto-round \
+        --device cpu --dtype bfloat16 --trust-remote-code
+    ```
+
+    Mixed W4A16/W8A16 checkpoint example:
+
+    ```bash
+    SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
+        --model-path INCModel4/Phi-4-multimodal-instruct-W4A16-Mixed-AutoRound \
+        --quantization auto-round \
+        --device cpu --dtype bfloat16 --trust-remote-code
+    ```
+
+    Limitations: 8-bit AutoRound MoE experts, 8-bit AWQ, and non-AMX CPU
+    backends are not supported by this path.
 
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)

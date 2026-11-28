@@ -35,13 +35,49 @@ _GPTQ_DEFAULTS = {
     "static_groups": False,
 }
 
+_REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
+
+
+def _canonicalize_auto_round_layer_name(name: str) -> str:
+    """Normalize checkpoint and runtime module names for config matching.
+
+    AutoRound exports commonly wrap quantized linear layers in a
+    ``.base_layer`` module and omit the multimodal ``language_model`` prefix.
+    SGLang strips ``base_layer`` while loading and keeps the wrapper prefix in
+    module names, so both sides need to be normalized before exact/regex
+    matching. Without this, mixed-bit configs silently fall back to the
+    checkpoint default bit width.
+    """
+
+    name = name.lstrip(".").replace(".base_layer.", ".")
+    if name.endswith(".base_layer"):
+        name = name[: -len(".base_layer")]
+    for prefix in (
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+        "model.",
+    ):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    return name
+
+
+def _is_regex_key(name: object) -> bool:
+    return isinstance(name, str) and any(c in _REGEX_SPECIAL_CHARS for c in name)
+
+
+def _normalize_auto_round_regex(pattern: str) -> str:
+    return pattern.replace(r"\.base_layer", "").replace(".base_layer", "")
+
 
 class AutoRoundConfig(QuantizationConfig):
     """Config class for AutoRound.
 
-    CPU support is limited to 4-bit AWQ/GPTQ checkpoints on the
-    Intel AMX backend. This is a limitation of SGLang's current CPU backend,
-    not a general AutoRound limitation.
+    CPU support covers 4-bit and 8-bit integer GPTQ-packed checkpoints on the
+    Intel AMX backend, including per-layer mixed W4/W8/W16 checkpoints. AWQ
+    remains 4-bit only on CPU.
 
     Reference: https://arxiv.org/pdf/2309.05516
     """
@@ -67,6 +103,9 @@ class AutoRoundConfig(QuantizationConfig):
         checkpoint_format: str = "",
         true_sequential: bool = False,
         static_groups: bool = False,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
+        act_bits: Optional[int] = None,
+        act_dynamic: Optional[bool] = None,
         gptq_defaulted_config_keys: Optional[tuple[str, ...]] = None,
     ) -> None:
         super().__init__()
@@ -95,12 +134,35 @@ class AutoRoundConfig(QuantizationConfig):
         self.group_size = group_size
         self.sym = sym
         self.packing_format = packing_format
-        self.block_name_to_quantize = (
+        block_names = (
             block_name_to_quantize.split(",")
             if isinstance(block_name_to_quantize, str)
             else block_name_to_quantize
         )
+        self.block_name_to_quantize = (
+            [_canonicalize_auto_round_layer_name(name) for name in block_names]
+            if block_names
+            else block_names
+        )
         self.extra_config = extra_config
+        self._exact_extra_config: dict[str, dict[str, Any]] = {}
+        self._regex_extra_config: list[tuple[str, str, dict[str, Any]]] = []
+        for key, cfg in (extra_config or {}).items():
+            if not isinstance(key, str):
+                continue
+            if _is_regex_key(key):
+                self._regex_extra_config.append(
+                    (key, _normalize_auto_round_regex(key), cfg)
+                )
+                continue
+            normalized_key = _canonicalize_auto_round_layer_name(key)
+            previous = self._exact_extra_config.get(normalized_key)
+            if previous is not None and previous != cfg:
+                raise ValueError(
+                    "Conflicting AutoRound extra_config entries after module-name "
+                    f"normalization for '{normalized_key}': {previous} vs {cfg}."
+                )
+            self._exact_extra_config[normalized_key] = cfg
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
@@ -110,8 +172,12 @@ class AutoRoundConfig(QuantizationConfig):
         self.checkpoint_format = checkpoint_format
         self.true_sequential = true_sequential
         self.static_groups = static_groups
+        self.packed_modules_mapping = packed_modules_mapping or {}
+        self.act_bits = act_bits
+        self.act_dynamic = act_dynamic
         self.gptq_defaulted_config_keys = gptq_defaulted_config_keys or ()
         self._logged_gptq_default_assumptions = False
+        self._logged_cpu_amx_activation_hint = False
 
     def __repr__(self) -> str:
         return (
@@ -177,6 +243,11 @@ class AutoRoundConfig(QuantizationConfig):
             checkpoint_format=cls.get_from_keys_or(config, ["checkpoint_format"], ""),
             true_sequential=cls.get_from_keys_or(config, ["true_sequential"], False),
             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
+            packed_modules_mapping=cls.get_from_keys_or(
+                config, ["packed_modules_mapping"], None
+            ),
+            act_bits=cls.get_from_keys_or(config, ["act_bits"], None),
+            act_dynamic=cls.get_from_keys_or(config, ["act_dynamic"], None),
             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
         )
 
@@ -191,40 +262,45 @@ class AutoRoundConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-        def get_config(name: str, quantized: bool = True):
-            if not self.extra_config:
-                return (
-                    self.weight_bits if quantized else 16,
-                    self.group_size if quantized else -1,
-                    self.sym if quantized else True,
-                )
+        canonical_layer_name = _canonicalize_auto_round_layer_name(layer_name)
+
+        def find_extra_config(name: str):
+            canonical_name = _canonicalize_auto_round_layer_name(name)
 
             # Exact match first
-            if name in self.extra_config:
-                cfg = self.extra_config[name]
+            cfg = self._exact_extra_config.get(canonical_name)
+            if cfg is not None:
+                return cfg
+
+            # Both the raw runtime name and the checkpoint-style name can be
+            # meaningful for user-supplied regexes (some are anchored with
+            # ``model.`` while SGLang module prefixes vary by architecture).
+            name_candidates = (
+                name,
+                canonical_name,
+                f"model.{canonical_name}",
+            )
+            for pattern, normalized_pattern, cfg in self._regex_extra_config:
+                try:
+                    if any(
+                        re.fullmatch(pattern, candidate)
+                        or re.fullmatch(normalized_pattern, candidate)
+                        for candidate in name_candidates
+                    ):
+                        return cfg
+                except re.error:
+                    # Invalid regex, ignore.
+                    continue
+            return None
+
+        def get_config(name: str, quantized: bool = True):
+            cfg = find_extra_config(name) if self.extra_config else None
+            if cfg is not None:
                 return (
                     cfg.get("bits", self.weight_bits if quantized else 16),
                     cfg.get("group_size", self.group_size if quantized else -1),
                     cfg.get("sym", self.sym if quantized else True),
                 )
-
-            REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
-            for pattern, cfg in self.extra_config.items():
-                if not isinstance(pattern, str) or not any(
-                    c in REGEX_SPECIAL_CHARS for c in pattern
-                ):
-                    continue
-
-                try:
-                    if re.fullmatch(pattern, name):
-                        return (
-                            cfg.get("bits", self.weight_bits if quantized else 16),
-                            cfg.get("group_size", self.group_size if quantized else -1),
-                            cfg.get("sym", self.sym if quantized else True),
-                        )
-                except re.error:
-                    # Invalid regex, ignore.
-                    continue
 
             return (
                 self.weight_bits if quantized else 16,
@@ -233,14 +309,15 @@ class AutoRoundConfig(QuantizationConfig):
             )
 
         # 1. Exact match from config
-        if self.extra_config and layer_name in self.extra_config:
+        if self.extra_config and canonical_layer_name in self._exact_extra_config:
             return get_config(layer_name)
 
         # 2. Determine whether layer should be quantized
         quantized = not isinstance(layer, ParallelLMHead)
         if self.block_name_to_quantize:
             quantized = any(
-                layer_name.startswith(name) for name in self.block_name_to_quantize
+                canonical_layer_name.startswith(name)
+                for name in self.block_name_to_quantize
             )
 
         # 3. Handle fused MoE
@@ -250,8 +327,8 @@ class AutoRoundConfig(QuantizationConfig):
         ):
             moe_configs = [
                 get_config(name, quantized)
-                for name in self.extra_config
-                if name.startswith(layer_name)
+                for name in self._exact_extra_config
+                if name.startswith(canonical_layer_name)
             ]
             if moe_configs:
                 if len(set(moe_configs)) == 1:
@@ -261,12 +338,18 @@ class AutoRoundConfig(QuantizationConfig):
                     f"consistent quant config for all sub-layers"
                 )
 
-        # 4. Handle fused QKV or other patterns
-        if self.extra_config:
+        # 4. Handle fused QKV or other patterns. A rule that matches the fused
+        # module itself takes precedence over expanding it into checkpoint
+        # shards, which may not carry the same rule.
+        if self.extra_config and find_extra_config(layer_name) is None:
             for fusion_key, sub_keys in self.packed_modules_mapping.items():
-                if fusion_key in layer_name and layer_name.count(fusion_key) == 1:
+                if (
+                    fusion_key in canonical_layer_name
+                    and canonical_layer_name.count(fusion_key) == 1
+                ):
                     sub_names = [
-                        layer_name.replace(fusion_key, sub_key) for sub_key in sub_keys
+                        canonical_layer_name.replace(fusion_key, sub_key)
+                        for sub_key in sub_keys
                     ]
                     sub_configs = [get_config(name, quantized) for name in sub_names]
                     if len(set(sub_configs)) == 1:
@@ -282,15 +365,41 @@ class AutoRoundConfig(QuantizationConfig):
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
 
-    def check_cpu_support(self, weight_bits: int) -> None:
-        if weight_bits != 4:
+    def check_cpu_support(self, weight_bits: int, *, is_moe: bool = False) -> None:
+        if weight_bits not in (4, 8):
             raise ValueError(
                 "SGLang's AutoRound CPU inference path currently supports "
-                "only 4-bit AWQ/GPTQ checkpoints because it uses the Intel "
-                f"AMX INT4 backend, but got {weight_bits}-bit."
+                "4-bit AWQ/GPTQ and 8-bit GPTQ checkpoints on Intel AMX, "
+                f"but got {weight_bits}-bit."
+            )
+        if weight_bits == 8 and not (
+            "gptq" in self.packing_format or "gptq" in self.backend
+        ):
+            raise ValueError(
+                "AutoRound 8-bit CPU inference requires the GPTQ packing "
+                f"format, but got packing_format={self.packing_format!r}."
+            )
+        if is_moe and weight_bits != 4:
+            raise ValueError(
+                "SGLang's AutoRound CPU AMX MoE path supports 4-bit experts "
+                "only; 8-bit AutoRound MoE is not implemented yet."
             )
         if not _is_cpu_amx_available:
             raise ValueError(_CPU_AMX_REQUIRED_MSG)
+        self.log_cpu_amx_activation_hint_once()
+
+    def log_cpu_amx_activation_hint_once(self) -> None:
+        if self._logged_cpu_amx_activation_hint:
+            return
+        self._logged_cpu_amx_activation_hint = True
+        logger.info(
+            "AutoRound CPU AMX executes INT weight checkpoints with dynamic "
+            "per-token INT8 activations: W4A16 runs as W4A8 and W8A16 runs as "
+            "W8A8. The checkpoint declares act_bits=%s and act_dynamic=%s; the "
+            "AMX runtime activation policy is act_bits=8, act_dynamic=True.",
+            self.act_bits,
+            self.act_dynamic,
+        )
 
     def log_gptq_default_assumptions_once(self) -> None:
         if self._logged_gptq_default_assumptions or not self.gptq_defaulted_config_keys:
@@ -355,7 +464,7 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         if _is_cpu:
-            self.check_cpu_support(weight_bits)
+            self.check_cpu_support(weight_bits, is_moe=isinstance(layer, FusedMoE))
             from sglang.srt.layers.quantization.awq import (
                 AWQCPUConfig,
                 AWQLinearMethod,
@@ -495,7 +604,7 @@ class AutoRoundConfig(QuantizationConfig):
             return None
 
         if _is_cpu:
-            self.check_cpu_support(weight_bits)
+            self.check_cpu_support(weight_bits, is_moe=isinstance(layer, FusedMoE))
             from sglang.srt.layers.quantization.gptq import CPUGPTQConfig
 
             quant_args = CPUGPTQConfig(
