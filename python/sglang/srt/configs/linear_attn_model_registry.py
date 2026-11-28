@@ -56,7 +56,9 @@ def register_linear_attn_model(spec: LinearAttnModelSpec) -> None:
 
 def get_linear_attn_config(hf_config: Any) -> Optional[tuple[LinearAttnModelSpec, Any]]:
     for spec in _LINEAR_ATTN_MODEL_REGISTRY:
-        config = hf_config.get_text_config() if spec.unwrap_text_config else hf_config
+        config = hf_config
+        if spec.unwrap_text_config and hasattr(hf_config, "get_text_config"):
+            config = hf_config.get_text_config()
         if isinstance(config, spec.config_class) and (
             spec.config_predicate is None or spec.config_predicate(config)
         ):

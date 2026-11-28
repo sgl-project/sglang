@@ -99,7 +99,11 @@ class GigaChat35ModelNextN(nn.Module):
         )
 
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            # Multimodal positions hold pad sentinels above the vocabulary;
+            # clamp them like the other multi-layer MTP drafts (#27512).
+            hidden_states = self.embed_tokens(
+                input_ids.clamp(min=0, max=self.vocab_size - 1)
+            )
         else:
             hidden_states = input_embeds
 
@@ -266,6 +270,8 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         return quant_config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # GigaChat3.5-Omni checkpoints nest the LM, MTP layers included, under language_model.
+        weights = ((name.removeprefix("language_model."), w) for name, w in weights)
         self.do_load_weights(_remap_gigachat_weight_names(weights), is_nextn=True)
 
     def post_load_weights(self, is_nextn: bool = True, weight_names=None) -> None:

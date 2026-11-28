@@ -22,6 +22,10 @@ from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.flint import FlintConfig
 from sglang.srt.configs.gigachat4 import GigaChat4Config
 from sglang.srt.configs.gigachat35 import GigaChat35Config
+from sglang.srt.configs.gigachat35_omni import (
+    GigaChat35OmniAudioConfig,
+    GigaChat35OmniConfig,
+)
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
@@ -159,6 +163,8 @@ __all__ = [
     "FalconMambaConfig",
     "GigaChat4Config",
     "GigaChat35Config",
+    "GigaChat35OmniAudioConfig",
+    "GigaChat35OmniConfig",
     "GraniteMoeHybridConfig",
     "HYV4Config",
     "HYV4FlashConfig",
