@@ -63,6 +63,80 @@ class TestScoreAndPool(CustomTestCase):
         self.assertIsInstance(out, EmbeddingPoolerOutput)
         self.assertEqual(out.embeddings.shape, (2, self.num_labels))
 
+    def test_multi_position_scoring_allocates_one_pooled_buffer(self):
+        """Scoring must not allocate a second full copy of the gathered states."""
+        hidden = torch.arange(32 * 512, dtype=torch.float32).reshape(32, 512)
+        head = nn.Linear(512, 2, bias=False)
+        with torch.no_grad():
+            head.weight.zero_()
+            head.weight[0, 0] = 1
+            head.weight[1, -1] = -1
+        expected = torch.tensor(
+            [
+                [512, -1023],
+                [1536, -2047],
+                [2560, -3071],
+                [4608, -5119],
+                [5632, -6143],
+                [6656, -7167],
+                [8704, -9215],
+                [9728, -10239],
+                [10752, -11263],
+                [12800, -13311],
+                [13824, -14335],
+                [14848, -15359],
+            ],
+            dtype=torch.float32,
+        )
+        pooled_bytes = 12 * 512 * hidden.element_size()
+        for delimiter_scoring in (False, True):
+            for return_hidden in (False, True):
+                with self.subTest(
+                    delimiter_scoring=delimiter_scoring, return_hidden=return_hidden
+                ):
+                    indices = [
+                        torch.tensor([2, 4, 6] if delimiter_scoring else [1, 3, 5])
+                        for _ in range(4)
+                    ]
+                    fb = _make_forward_batch(
+                        [8] * 4,
+                        multi_item_delimiter_indices=(
+                            indices if delimiter_scoring else None
+                        ),
+                        token_indices_to_pool=None if delimiter_scoring else indices,
+                        return_pooled_hidden_states=return_hidden,
+                    )
+                    with (
+                        torch.inference_mode(),
+                        torch.profiler.profile(
+                            activities=[torch.profiler.ProfilerActivity.CPU],
+                            profile_memory=True,
+                        ) as profile,
+                    ):
+                        output = score_and_pool(
+                            head, self.pooler, hidden, fb, torch.arange(32)
+                        )
+                    torch.testing.assert_close(
+                        torch.cat(output.embeddings), expected, rtol=0, atol=0
+                    )
+                    if return_hidden:
+                        for row, pooled in enumerate(output.pooled_hidden_states):
+                            torch.testing.assert_close(
+                                pooled,
+                                hidden[row * 8 + 1 : row * 8 + 6 : 2],
+                                rtol=0,
+                                atol=0,
+                            )
+                    else:
+                        self.assertIsNone(output.pooled_hidden_states)
+                    allocated = sum(
+                        max(event.self_cpu_memory_usage, 0)
+                        for event in profile.events()
+                    )
+                    # Allow small index/score tensors and bookkeeping, but not
+                    # another 24 KiB copy of all pooled hidden states.
+                    self.assertLess(allocated, pooled_bytes + 16 * 1024)
+
     def test_mis_returns_per_request_list(self):
         """Delimiter indices provided -> returns a list with one tensor per request."""
         # Sequence: [0, 1, 2, D, 3, 4, 5, D, 6, 7, 8, D]
