@@ -19,6 +19,7 @@ from sglang.kernels.ops.speculative.dspark import dspark_accept
 from sglang.srt.layers.sampler import top_k_top_p_min_p_filter_sorted_probs_torch
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
@@ -253,6 +254,7 @@ def test_eagle_dense_verify_applies_min_p():
         sampling_seed=None,
         step_penalties=None,
         logit_bias=None,
+        has_custom_logit_processor=False,
     )
     verify_input = SimpleNamespace(
         draft_token_num=width,
@@ -273,6 +275,12 @@ def test_eagle_dense_verify_applies_min_p():
     logits_output = SimpleNamespace(
         next_token_logits=probs.log(), next_token_logits_vocab_shard=None
     )
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=True),
+        watermark=None,
+        watermark_full_mask=True,
+    )
 
     class _Stop(Exception):
         pass
@@ -288,7 +296,7 @@ def test_eagle_dense_verify_applies_min_p():
         patch.object(eagle_utils, "tree_speculative_sampling_target_only", sample),
         pytest.raises(_Stop),
     ):
-        eagle_utils.eagle_sample(verify_input, batch, logits_output)
+        eagle_utils.eagle_sample(verify_input, verify, logits_output)
     want = _sampler_min_p(probs, torch.repeat_interleave(info.min_ps, width))
     assert torch.equal(seen[0] > 0, want > 0)
     torch.testing.assert_close(seen[0], want)

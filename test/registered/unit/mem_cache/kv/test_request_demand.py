@@ -16,7 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     branch_checkpoint,
     prefill_checkpoint_boundary,
 )
-from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.mem_cache.kv.alloc.demand import (
     chunk_granule,
     largest_fitting_chunk,
@@ -96,7 +96,7 @@ class _WindowCache(RadixCache):
 
 def _decode_reserve(reserve):
     return patch(
-        "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+        "sglang.srt.mem_cache.allocation_sizing.get_decode_ahead",
         return_value=reserve,
     )
 
@@ -124,7 +124,7 @@ def _retired_peak(
     picks (`prefill_checkpoint_boundary`, or `branch_checkpoint` for a
     ``full_kv_hit``) and the tree retires behind it, as `checkpoint_into_tree`
     does. A speculative ``reserve`` allocates ahead per decode step
-    (`spec_decode_alloc_lens`) and accepts one token per step."""
+    (`decode_alloc_targets`) and accepts one token per step."""
     cache = _WindowCache(
         window=window,
         page_size=page_size,
@@ -215,7 +215,7 @@ def _retired_peak(
                     kv_allocated_len=allocated, kv_committed_len=committed
                 )
                 with _decode_reserve(reserve):
-                    _, nxt, _ = spec_decode_alloc_lens(
+                    _, nxt, _ = decode_alloc_targets(
                         [SimpleNamespace(kv=kv)], page_size=page_size
                     )
                 allocated = nxt[0]
@@ -366,7 +366,7 @@ class TestDecodeRowsAllocatedAhead(CustomTestCase):
             kv=SimpleNamespace(kv_allocated_len=prompt, kv_committed_len=prompt)
         )
         with _decode_reserve(reserve):
-            _, nxt, _ = spec_decode_alloc_lens([req], page_size=page_size)
+            _, nxt, _ = decode_alloc_targets([req], page_size=page_size)
         return nxt[0]
 
     def test_a_speculative_reserve_beyond_a_short_request(self):

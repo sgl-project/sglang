@@ -252,7 +252,10 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         batch.tree_cache = cache
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         batch.reqs = [
-            SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8), beam_group=None)
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=8, kv_allocated_len=8),
+                beam_group=None,
+            )
             for _ in range(6)
         ]
         self.assertTrue(batch.check_decode_mem())

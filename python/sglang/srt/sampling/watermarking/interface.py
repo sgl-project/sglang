@@ -34,7 +34,7 @@ class WatermarkRows(Protocol):
 
 
 @dataclass(frozen=True)
-class SampleStep:
+class SampleWatermarkOutput:
     # What the stock sampler must sample with.
     sampling_info: SamplingBatchInfo
     # The pre-watermark logits, iff the caller asked to keep them for logprobs.
@@ -49,7 +49,7 @@ class SampleStep:
 class SampleWatermark(Protocol):
     """One ordinary sampling step's watermark, bound to its forward batch."""
 
-    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleStep: ...
+    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleWatermarkOutput: ...
 
     def commit(self, token_ids: Tensor) -> None: ...
 

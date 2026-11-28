@@ -1,6 +1,7 @@
 """SchedulerBatchResultProcessor._flush_prefill: a generation prefill's per-request
 KV calls are queued and run in order, before free_group_end and the send. A subclass
-that sends first gets the same KV calls, in the same order and one free group."""
+that sends first gets the same KV calls, in the same order and one free group. A PD
+decode admission sends the first token per --disaggregation-decode-first-token-stream."""
 
 import unittest
 from array import array
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -209,6 +211,36 @@ class TestFlushPrefill(CustomTestCase):
             _run(_StreamFirst, hisparse=True),
             ["free_group_begin", SEND, *kv_calls, "free_group_end"],
         )
+
+
+class TestPrebuiltFirstToken(CustomTestCase):
+    def test_running_requests_send_the_prefill_token_only_at_admission(self):
+        """A request that finishes at admission is sent there in both modes; a
+        running one's prefill token goes out at admission only with "admission",
+        and otherwise waits for its first decode output."""
+        for mode, sent in (("admission", ["r0", "r1"]), ("first_decode", ["r0"])):
+            with self.subTest(mode=mode):
+                reqs = [_req("r0", 1), _req("r1")]
+                for req in reqs:
+                    req.output_ids.append(7)
+                streamer = Mock()
+                processor = SchedulerBatchResultProcessor(
+                    **_processor_kwargs(
+                        disaggregation_mode=DisaggregationMode.DECODE,
+                        request_retirer=Mock(),
+                        output_streamer=streamer,
+                    )
+                )
+                batch = ScheduleBatch(
+                    reqs=reqs, spec_algorithm=SpeculativeAlgorithm.NONE
+                )
+                with get_context().override_server_args(
+                    disaggregation_decode_enable_radix_cache=False,
+                    disaggregation_decode_first_token_stream=mode,
+                ):
+                    processor.process_batch_result_prebuilt(batch)
+                (stream_reqs, _), _ = streamer.stream_output.call_args
+                self.assertEqual([req.rid for req in stream_reqs], sent)
 
 
 def _running_req(cache, start):

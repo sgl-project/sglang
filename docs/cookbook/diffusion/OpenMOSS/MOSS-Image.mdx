@@ -1,7 +1,6 @@
 ---
 title: MOSS-Image
 description: "Serve MOSS-Image with native Qwen3.5 conditioning, FLUX.2 decoding, and request-level guidance."
-tag: NEW
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';

@@ -334,37 +334,34 @@ class TestWindowRetirement(CustomTestCase):
                 self.subTest(shares=shares, no_overlap=no_overlap),
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec),
+                patch(
+                    "sglang.srt.mem_cache.allocation_sizing.get_spec",
+                    return_value=spec,
+                ),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(32),
             ):
                 self.assertEqual(
                     window_retirement(shares_prefixes=shares),
-                    (lag, 0 if no_overlap else 1, 32),
+                    (lag, 1, 32),
                 )
 
     def test_a_decode_step_allocates_ahead_of_its_processed_length(self):
-        """Decode allocates ahead of retirement by the overlapped step, or by the
-        speculative reserve, which covers the overlap lag too."""
-        for algorithm, no_overlap, lag in (
-            (None, False, 1),
-            (None, True, 0),
-            ("EAGLE", False, 10),
-            ("EAGLE", True, 10),
-        ):
+        """Decode allocates ahead of retirement by the decode-ahead, which
+        covers the overlap lag too."""
+        for no_overlap in (False, True):
             schedule = SimpleNamespace(
                 chunked_prefill_size=16, disable_overlap_schedule=no_overlap
             )
-            spec = SimpleNamespace(speculative_algorithm=algorithm)
             with (
-                self.subTest(algorithm=algorithm, no_overlap=no_overlap),
+                self.subTest(no_overlap=no_overlap),
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
-                patch("sglang.srt.runtime_context.get_spec", return_value=spec),
                 patch(
-                    "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+                    "sglang.srt.mem_cache.allocation_sizing.get_decode_ahead",
                     return_value=10,
                 ),
             ):
                 retirement = window_retirement(shares_prefixes=True)
-                self.assertEqual(retirement.decode_retire_lag, lag)
+                self.assertEqual(retirement.decode_retire_lag, 10)
 
 
 class TestAdmission(_AdderCase):

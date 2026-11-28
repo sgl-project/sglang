@@ -38,8 +38,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens <= max_req_len + 1; the final
-         generated token is sampled but never forwarded into the KV cache
+      1. context: input_len + max_new_tokens <= max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -136,7 +135,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate <= scheduler.max_req_len + 1
+            context_ok = input_len + candidate <= scheduler.max_req_len
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -184,14 +183,14 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
             scheduler = self._new_scheduler(max_req_len=max_req_len)
             req = self._new_req(max_new_tokens=64, input_len=input_len)
             self.assertEqual(
-                self._init_and_check(scheduler, req), max_req_len - input_len + 1
+                self._init_and_check(scheduler, req), max_req_len - input_len
             )
 
     def test_public_context_boundary_is_not_clipped(self):
         """A request accepted at the public context limit keeps its full output."""
         context_len, input_len = 4096, 4080
         scheduler = self._new_scheduler(
-            max_req_len=context_len - 1,
+            max_req_len=context_len,
             max_total_num_tokens=1 << 20,
         )
         req = self._new_req(
@@ -342,13 +341,12 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         size_full = scheduler.token_to_kv_pool_allocator.size_full
         scheduler.max_total_num_tokens = size_full // 4
         scheduler.max_req_len = size_full // 2
-        # The longest prompt the tokenizer lets through: max_req_len - 5.
-        input_len = scheduler.max_req_len - 5
+        input_len = scheduler.max_req_len - 6
         req = self._new_req(max_new_tokens=32, input_len=input_len)
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(
-            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len + 1
+            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len
         )
 
     def test_pd_prefill_forces_one_handoff_token(self):

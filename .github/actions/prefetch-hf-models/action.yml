@@ -34,6 +34,7 @@ runs:
       env:
         PREFETCH_PYTHON: ${{ steps.prefetch-python.outputs.python-path }}
       run: |
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib"
         "$PREFETCH_PYTHON" -I -m pip install --isolated --disable-pip-version-check --quiet \
           --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple \
           --target "$RUNNER_TEMP/hf-prefetch" \
@@ -49,5 +50,6 @@ runs:
         HF_TOKEN: ${{ inputs.hf-token }}
         REPO_IDS: ${{ inputs.repo-ids }}
       run: |
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib"
         PYTHONPATH="$RUNNER_TEMP/hf-prefetch" "$PREFETCH_PYTHON" -S \
           "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_hf_models.py"

@@ -131,6 +131,38 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
 
+    def test_gpu_jpeg_path_returns_rgb_for_mixed_grayscale_and_rgb(self):
+        """#26751: a mixed JPEG batch must reach the processor as 3 channels.
+
+        Execute torchvision's real decoder on CPU at the CUDA boundary, so
+        CPU CI checks the selected color mode and resulting pixels together.
+        """
+        from torchvision.io import ImageReadMode, decode_jpeg
+
+        def decode_on_cpu(data, **kwargs):
+            self.assertEqual(kwargs.pop("device"), "cuda")
+            return decode_jpeg(data, **kwargs)
+
+        outputs = []
+        for mode in ("L", "RGB"):
+            image = Image.open(io.BytesIO(_jpeg_bytes())).convert(mode)
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG")
+            data = buf.getvalue()
+            expected = decode_jpeg(
+                torch.frombuffer(bytearray(data), dtype=torch.uint8),
+                mode=ImageReadMode.RGB,
+            )
+            with (
+                patch.object(media_io, "is_jpeg_with_cuda", return_value=True),
+                patch("torchvision.io.decode_jpeg", side_effect=decode_on_cpu),
+            ):
+                actual = media_io._load_image(data, gpu_image_decode=True)
+            self.assertIsInstance(actual, torch.Tensor)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            outputs.append(actual)
+        self.assertEqual(torch.stack(outputs).shape, (2, 3, 8, 8))
+
     def test_high_fidelity_gpu_jpeg_decoder_is_selected(self):
         data = _jpeg_bytes()
         expected = torch.zeros((3, 8, 8), dtype=torch.uint8)

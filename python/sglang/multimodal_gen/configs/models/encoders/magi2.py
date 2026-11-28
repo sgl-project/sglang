@@ -2,28 +2,15 @@
 
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.encoders.base import (
-    TextEncoderArchConfig,
-    TextEncoderConfig,
+from sglang.multimodal_gen.configs.models.encoders.qwen3_5 import (
+    Qwen3_5EncoderArchConfig,
+    Qwen3_5EncoderConfig,
 )
 
 
 @dataclass
-class Magi2TextEncoderArchConfig(TextEncoderArchConfig):
-    """KNOWN DEVIATION: loads through transformers, not srt/models/qwen3_5.py, which needs a KV cache and ForwardBatch."""
-
-    hidden_size: int = 5120
-    num_hidden_layers: int = 64
-    num_attention_heads: int = 24
-    num_key_value_heads: int = 4
-    head_dim: int = 256
-    intermediate_size: int = 17408
-    vocab_size: int = 248320
-    rms_norm_eps: float = 1e-6
-    hidden_act: str = "silu"
-    attn_output_gate: bool = True
-    full_attention_interval: int = 4
-    eos_token_id: int = 248044
+class Magi2TextEncoderArchConfig(Qwen3_5EncoderArchConfig):
+    """Qwen3.5-27B; ``text_config`` is read from the checkpoint at load time."""
 
     text_len: int = 7000
 
@@ -41,7 +28,7 @@ class Magi2TextEncoderArchConfig(TextEncoderArchConfig):
 
 
 @dataclass
-class Magi2TextEncoderConfig(TextEncoderConfig):
+class Magi2TextEncoderConfig(Qwen3_5EncoderConfig):
     arch_config: Magi2TextEncoderArchConfig = field(
         default_factory=Magi2TextEncoderArchConfig
     )

@@ -121,9 +121,6 @@ class HeadManager:
         )
         self.is_generation = False
         self.allow_auto_truncate = False
-        self.context_len = 4096
-        self.num_reserved_tokens = 0
-        # min(context_len - 1, kv_capacity - 1) - 5, as the scheduler reports it.
         self.max_req_input_len = 4090
         self.mm_processor = PatchCounter()
         self.request_logger = SimpleNamespace(log_requests=False)
@@ -136,10 +133,8 @@ class HeadManager:
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         num_tokens = _expanded_length(request)
-        if num_tokens + self.num_reserved_tokens >= self.context_len:
+        if num_tokens > self.max_req_input_len:
             raise ValueError(f"The input ({num_tokens} tokens) is too long")
-        if num_tokens >= self.max_req_input_len:
-            raise ValueError(f"The scheduler refuses a prompt of {num_tokens} tokens")
         if num_tokens > get_schedule().max_prefill_tokens:
             raise ValueError(f"A prefill of {num_tokens} tokens outgrows its memory")
         questions = parse_decision_layout(request.decision_layout, num_tokens)
@@ -297,7 +292,7 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         input_ids, layout = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**REQUEST),
-            max_length=4089,
+            max_length=4090,
             image_token_counts=[],
         )
         (sent,) = manager.requests
@@ -338,7 +333,7 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(base64.b64decode(forwarded.url.split(",", 1)[1]), data)
         self.assertEqual(forwarded.detail, "high")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body)["usage"]["input_tokens"], 4089)
+        self.assertEqual(json.loads(response.body)["usage"]["input_tokens"], 4090)
 
     async def test_refusals(self):
         manager = HeadManager(self.tokenizer)
@@ -381,8 +376,8 @@ def _admission_manager(joint_head_config):
         joint_head_config=joint_head_config, pointer_head=None
     )
     manager.is_generation = joint_head_config is None
-    manager.context_len = 4096
     manager.num_reserved_tokens = 0
+    manager.max_req_len = 4096
     manager.max_req_input_len = 4090
     # A layout must be refused before auto-truncation could cut its prompt.
     manager.allow_auto_truncate = True
@@ -411,13 +406,12 @@ class TestJointSchemaAdmission(CustomTestCase):
         generation = GenerateReqInput(input_ids=[1, 2, 3], sampling_params={})
         refused = {
             "generation": (generation, "/v1/systemone"),
-            # 4095 tokens pass the context check, but the scheduler takes 4089.
-            "past one prefill": (embedding(4095), "at most 4089"),
+            "past one prefill": (embedding(4095), "at most 4090"),
         }
         for name, (obj, message) in refused.items():
             with self.subTest(name), self.assertRaisesRegex(ValueError, message):
                 clef._validate_one_request(obj, obj.input_ids)
-        clef._validate_one_request(embedding(4089), [1] * 4089)
+        clef._validate_one_request(embedding(4090), [1] * 4090)
         # A server without a joint schema head keeps generating.
         _admission_manager(None)._validate_one_request(generation, [1, 2, 3])
 
